@@ -26,17 +26,25 @@ def parseOpencodeOutput (line : String) : Option Event := do
     let state := jVal part "state" |>.getD (Json.mkObj [])
     let input := jVal state "input" |>.getD (Json.mkObj [])
     some (.assistant (.toolUse tool input))
-  | "text" =>
+  | "reasoning" =>
     let part ← jVal json "part"
     let text := jStr part "text"
-    if text.isEmpty then none else some (.assistant (.text text))
+    if text.isEmpty then none else some (.assistant (.thinking text))
+  | "text" =>
+    let part ← jVal json "part"
+    let reasoning := jStr part "reasoning_content"
+    if !reasoning.isEmpty then
+      some (.assistant (.thinking reasoning))
+    else
+      let text := jStr part "text"
+      if text.isEmpty then none else some (.assistant (.text text))
   | "step_finish" =>
     let part ← jVal json "part"
     let reason := jStr part "reason"
     if reason == "stop" then
       some (.result .success none none none "")
     else
-      some (.unknown s!"step_finish({reason})")
+      none
   | other => some (.unknown other)
 
 
@@ -45,7 +53,11 @@ def opencode : AgentDef where
   command := "opencode"
   sandboxPaths := {
     rox     := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix", "/run", "/run/current-system/sw/bin"]
-    ro      := ["/etc", "/run", "/dev", "/proc", "/sys"]
+    ro      := [
+      "/etc", "/run", "/dev", "/proc", "/sys",
+      -- bad, needs to probably be fixed in opencode itself
+      "/home"
+    ]
     rw      := ["/dev/null"]
     homeRox := [".elan", ".cache", ".local"]
     homeRw  := [".config/opencode", ".gitconfig", ".local/share/opencode"]
@@ -58,7 +70,8 @@ def opencode : AgentDef where
   buildArgs _ _ _ model _ resume _ prompt := Id.run do
     let mut args : Array String := #[
       "run", "--format", "json",
-      "--log-level", "ERROR", "--port", "4096"
+      "--log-level", "ERROR", "--port", "4096",
+      "--thinking", "--dangerously-skip-permissions"
     ]
     if let some m := model then
       args := args.push "--model" |>.push m
