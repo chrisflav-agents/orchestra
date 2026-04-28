@@ -41,12 +41,8 @@ def parseOpencodeOutput (line : String) : Option Event := do
   | "step_finish" =>
     let part ← jVal json "part"
     let reason := jStr part "reason"
-    if reason == "stop" then
-      some (.result .success none none none "")
-    else
-      none
+    if reason == "stop" then some (.result .success none none none "") else none
   | other => some (.unknown other)
-
 
 /-- The opencode coding agent backend. -/
 def opencode : AgentDef where
@@ -63,7 +59,6 @@ def opencode : AgentDef where
     homeRw  := [".config/opencode", ".gitconfig", ".local/share/opencode"]
     extraPorts := [4096]
   }
-
   setupMcp _ _ _ := do
     -- TODO: Implement MCP configuration for opencode
     return ("", #[])
