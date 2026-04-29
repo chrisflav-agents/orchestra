@@ -28,20 +28,6 @@ private def stripExt (s ext : String) : String :=
 private def shellQuote (s : String) : String :=
   "'" ++ s.replace "'" "'\\''" ++ "'"
 
--- Task execution
-
-/-- Run a single task: clone repo, start MCP server, run validation loop.
-    Returns the task ID and whether the run was cut short by a usage limit. -/
-private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
-    (continuesFrom : Option String := none)
-    (series : Option String := none)
-    (cancelToken : Option Std.CancellationToken := none)
-    (interactive : Bool := true) : IO (String × Bool × Option Lean.Json) := do
-  let ((taskId, usageLimitHit), _, outputJson) ←
-    TaskRunner.runIOTask appConfig task.ioTask idx debug default
-      continuesFrom series cancelToken interactive
-  return (taskId, usageLimitHit, outputJson)
-
 -- Helpers
 
 /-- If `series` is already set, return it unchanged.
@@ -104,7 +90,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
         | some b =>
           let t := tasks[i]!
           { t with ioTask := { t.ioTask with budget := some b } }
-      let _ ← runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
+      let _ ← TaskRunner.runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
 
@@ -245,7 +231,7 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
       priority      := prevRecord.priority
     }
   }
-  let _ ← runTask appConfig task 0 debug
+  let _ ← TaskRunner.runTask appConfig task 0 debug
     (continuesFrom := some prevId) (series := some seriesName)
   return (0 : UInt32)
 
@@ -469,7 +455,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       | none    => pure appConfig
       | some cp => loadAppConfig (some (System.FilePath.mk cp))
     try
-      let (taskId, usageLimitHit, outputJson) ← runTask cfg task 0 debug
+      let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
         (cancelToken := some taskToken) (interactive := false)
       removeToken

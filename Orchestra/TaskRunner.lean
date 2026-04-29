@@ -287,4 +287,16 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
         pure none
   return ((taskId, usageLimitHit), typedOutput, outputJson)
 
+/-- Run a single task: clone repo, start MCP server, run validation loop.
+    Returns the task ID, whether the run was cut short by a usage limit, and the raw output JSON. -/
+def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
+    (continuesFrom : Option String := none)
+    (series : Option String := none)
+    (cancelToken : Option Std.CancellationToken := none)
+    (interactive : Bool := true) : IO (String × Bool × Option Lean.Json) := do
+  let ((taskId, usageLimitHit), _, outputJson) ←
+    runIOTask appConfig task.ioTask idx debug default
+      continuesFrom series cancelToken interactive
+  return (taskId, usageLimitHit, outputJson)
+
 end Orchestra.TaskRunner
