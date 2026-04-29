@@ -232,16 +232,17 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
   let task : Task := {
     i := .unit, o := .unit
     ioTask := {
-      upstream     := prevRecord.upstream
-      fork         := prevRecord.fork
-      mode         := prevRecord.mode
+      upstream      := prevRecord.upstream
+      fork          := prevRecord.fork
+      mode          := prevRecord.mode
       prompt
-      backend      := prevRecord.backend
-      model        := prevRecord.model
-      agent        := prevRecord.agent
-      systemPrompt := prevRecord.systemPrompt
-      budget       := budgetFlag.orElse (fun _ => prevRecord.budget)
-      priority     := prevRecord.priority
+      backend       := prevRecord.backend
+      model         := prevRecord.model
+      agent         := prevRecord.agent
+      systemPrompt  := prevRecord.systemPrompt
+      prependPrompt := prevRecord.prependPrompt
+      budget        := budgetFlag.orElse (fun _ => prevRecord.budget)
+      priority      := prevRecord.priority
     }
   }
   let _ ← runTask appConfig task 0 debug
@@ -298,6 +299,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       model         := prevRecord.model
       agent         := prevRecord.agent
       systemPrompt  := prevRecord.systemPrompt
+      prependPrompt := prevRecord.prependPrompt
       budget        := budgetFlag.orElse (fun _ => prevRecord.budget)
       priority      := priorityFlag.getD prevRecord.priority
     }
@@ -327,14 +329,15 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       let createdAt ← TaskStore.currentIso8601
       let entry : Queue.QueueEntry := {
         id, createdAt
-        upstream     := task.ioTask.upstream
-        fork         := task.ioTask.fork
-        mode         := task.ioTask.mode
-        prompt       := task.ioTask.prompt
-        agent        := task.ioTask.agent
-        systemPrompt := task.ioTask.systemPrompt
-        backend      := task.ioTask.backend
-        model        := task.ioTask.model
+        upstream      := task.ioTask.upstream
+        fork          := task.ioTask.fork
+        mode          := task.ioTask.mode
+        prompt        := task.ioTask.prompt
+        agent         := task.ioTask.agent
+        systemPrompt  := task.ioTask.systemPrompt
+        prependPrompt := task.ioTask.prependPrompt
+        backend       := task.ioTask.backend
+        model         := task.ioTask.model
         continuesFrom, series
         configPath
         budget       := budgetFlag.orElse (fun _ => task.ioTask.budget)
@@ -451,6 +454,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         prompt       := entry.prompt
         agent        := entry.agent
         systemPrompt := entry.systemPrompt
+        prependPrompt := entry.prependPrompt
         backend      := entry.backend
         model        := entry.model
         budget       := entry.budget

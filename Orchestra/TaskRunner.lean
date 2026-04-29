@@ -1,6 +1,7 @@
 import Orchestra.Config
 import Orchestra.AgentDef
 import Orchestra.Agents.Claude
+import Orchestra.Agents.Opencode
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
 import Orchestra.GitHub
@@ -188,7 +189,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     | none,    some mp => some mp
     | some sp, some mp => some (sp ++ "\n\n" ++ mp)
   -- 5b. Load prepend prompt and apply to task prompt
-  let prependPrompt ← loadPrependPrompt
+  let prependPrompt ← loadPrependPrompt ioTask.prependPrompt
   let baseTaskPrompt :=
     match prependPrompt with
     | none    => ioTask.prompt
@@ -207,8 +208,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     let resume := if attempt == 0 then initialResume else sessionId
     IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
     let agentDef := match ioTask.backend with
-      | some "pi"   => AgentDef.pi
-      | some "vibe" => AgentDef.vibe
+      | some "pi"       => AgentDef.pi
+      | some "vibe"     => AgentDef.vibe
+      | some "opencode" => AgentDef.opencode
       | _           => AgentDef.claude
     let backendName := ioTask.backend.getD "claude"
     let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName ioTask.authSource

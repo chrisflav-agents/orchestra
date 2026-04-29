@@ -48,6 +48,7 @@ structure QueueEntry where
   prompt        : String
   agent         : Option String := none
   systemPrompt  : Option String := none
+  prependPrompt : Option String := none
   backend       : Option String := none
   model         : Option String := none
   continuesFrom : Option String := none
@@ -91,6 +92,7 @@ instance : ToJson QueueEntry where
     ]
     let fields := if let some s := e.agent         then fields ++ [("agent",           Json.str s)]      else fields
     let fields := if let some s := e.systemPrompt  then fields ++ [("system_prompt",   Json.str s)]      else fields
+    let fields := if let some s := e.prependPrompt   then fields ++ [("prepend_prompt",   Json.str s)]      else fields
     let fields := if let some s := e.backend       then fields ++ [("backend",         Json.str s)]      else fields
     let fields := if let some s := e.model         then fields ++ [("model",           Json.str s)]      else fields
     let fields := if let some s := e.continuesFrom then fields ++ [("continues_from",  Json.str s)]      else fields
@@ -120,6 +122,7 @@ instance : FromJson QueueEntry where
     let prompt       ← j.getObjValAs? String "prompt"
     let agent         := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt  := j.getObjValAs? String "system_prompt"  |>.toOption
+    let prependPrompt   := j.getObjValAs? String "prepend_prompt"  |>.toOption
     let backend       := j.getObjValAs? String "backend"        |>.toOption
     let model         := j.getObjValAs? String "model"          |>.toOption
     let continuesFrom := j.getObjValAs? String "continues_from" |>.toOption
@@ -137,7 +140,7 @@ instance : FromJson QueueEntry where
     let outputType     := j.getObjValAs? ResultType "output_type"     |>.toOption |>.getD .unit
     let inputJson      := j.getObjVal?   "input_json"                 |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
-             agent, systemPrompt, backend, model, continuesFrom, series, taskId, configPath,
+             agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
              concertStepKey, inputType, outputType, inputJson }
 

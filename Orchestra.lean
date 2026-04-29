@@ -3,6 +3,7 @@ import Orchestra.ConcertManager
 import Orchestra.Agents.Claude
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
+import Orchestra.Agents.Opencode
 import Orchestra.Concert
 import Orchestra.Config
 import Orchestra.GitHub

@@ -150,6 +150,7 @@ structure IOTask (i o : ResultType) where
   prompt : String
   agent : Option String := none
   systemPrompt : Option String := none
+  prependPrompt : Option String := none
   /-- Agent backend to use: "claude" (default) or "vibe". -/
   backend : Option String := none
   /-- Model override passed to the agent (e.g. "sonnet", "devstral-small"). -/
@@ -258,6 +259,7 @@ instance : FromJson Task where
     let prompt     ← j.getObjValAs? String "prompt"
     let agent      := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption
+    let prependPrompt := j.getObjValAs? String "prepend_prompt" |>.toOption
     let backend    := j.getObjValAs? String "backend"        |>.toOption
     let model      := j.getObjValAs? String "model"          |>.toOption
     let budget     := j.getObjValAs? Float "budget"          |>.toOption
@@ -267,7 +269,7 @@ instance : FromJson Task where
     let readOnly   := j.getObjValAs? Bool "read_only"        |>.toOption |>.getD false
     let series     := j.getObjValAs? String "series"         |>.toOption
     let priority   := j.getObjValAs? Nat "priority"          |>.toOption |>.getD 10
-    return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, backend, model,
+    return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, authSource, tools, readOnly, series, priority } }
 
 structure AppConfig where
@@ -359,12 +361,12 @@ def loadSystemPrompt (name : Option String := none) : IO (Option String) := do
     return none
 
 /--
-Load a prepend prompt from `~/.agent/prompts/default-prepend.md`.
-If the file exists, its contents will be prepended to every task prompt.
-Returns `none` if the file does not exist.
+Load a prepend prompt from `~/.agent/prompts/<name>.md`.
+If `name` is `none`, reads `default-prepend.md`. Returns `none` if the file does not exist.
 -/
-def loadPrependPrompt : IO (Option String) := do
-  let promptPath ← expandHome "~/.agent/prompts/default-prepend.md"
+def loadPrependPrompt (name : Option String := none) : IO (Option String) := do
+  let promptName := name.getD "default-prepend"
+  let promptPath ← expandHome s!"~/.agent/prompts/{promptName}.md"
   if ← promptPath.pathExists then
     return some (← IO.FS.readFile promptPath)
   else
