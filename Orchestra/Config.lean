@@ -55,25 +55,28 @@ inductive ResultType where
   | bool
   | list (t : ResultType)
   | unit
+  | mapping (fields : List (String × ResultType))
   deriving Repr, BEq, Inhabited
 
 /-- The Lean `Type` corresponding to a `ResultType`. -/
 abbrev ResultType.Type : ResultType → Type
-  | .string   => String
-  | .unit     => Unit
-  | .bool     => Bool
-  | .nat      => Nat
-  | .int      => Int
-  | .list t   => List t.Type
+  | .string      => String
+  | .unit        => Unit
+  | .bool        => Bool
+  | .nat         => Nat
+  | .int         => Int
+  | .list t      => List t.Type
+  | .mapping _   => Json
 
 instance (t : ResultType) : Inhabited t.Type :=
   match t with
-  | .string => ⟨""⟩
-  | .unit   => ⟨()⟩
-  | .bool   => ⟨false⟩
-  | .nat    => ⟨0⟩
-  | .int    => ⟨0⟩
-  | .list _ => ⟨[]⟩
+  | .string    => ⟨""⟩
+  | .unit      => ⟨()⟩
+  | .bool      => ⟨false⟩
+  | .nat       => ⟨0⟩
+  | .int       => ⟨0⟩
+  | .list _    => ⟨[]⟩
+  | .mapping _ => ⟨.null⟩
 
 private partial def resultTypeFromJson : Json → Except String ResultType
   | .str "string" => .ok .string
@@ -84,59 +87,85 @@ private partial def resultTypeFromJson : Json → Except String ResultType
   | j =>
       match j.getObjVal? "list" |>.toOption with
       | some inner => resultTypeFromJson inner |>.map .list
-      | none       => .error s!"expected ResultType, got {j.compress}"
+      | none       =>
+        match j.getObjVal? "mapping" |>.toOption with
+        | some arr => do
+            let pairs ← arr.getArr?
+            let fields ← pairs.toList.mapM fun p => do
+              let key ← p.getObjValAs? String "key"
+              let typ ← resultTypeFromJson (← p.getObjVal? "type")
+              return (key, typ)
+            return .mapping fields
+        | none => .error s!"expected ResultType, got {j.compress}"
 
 instance : FromJson ResultType where
   fromJson? := resultTypeFromJson
 
-private def resultTypeToJson : ResultType → Json
-  | .string   => "string"
-  | .int      => "int"
-  | .nat      => "nat"
-  | .bool     => "bool"
-  | .unit     => "unit"
-  | .list t   => Json.mkObj [("list", resultTypeToJson t)]
+private partial def resultTypeToJson : ResultType → Json
+  | .string      => "string"
+  | .int         => "int"
+  | .nat         => "nat"
+  | .bool        => "bool"
+  | .unit        => "unit"
+  | .list t      => Json.mkObj [("list", resultTypeToJson t)]
+  | .mapping fs  =>
+      let arr := fs.map fun (k, t) => Json.mkObj [("key", k), ("type", resultTypeToJson t)]
+      Json.mkObj [("mapping", .arr arr.toArray)]
 
 instance : ToJson ResultType where
   toJson := resultTypeToJson
 
 /-- Human-readable description of a value of the given result type, for use in tool descriptions. -/
-def ResultType.toDescription : ResultType → String
-  | .string   => "a JSON string"
-  | .int      => "a JSON integer (may be negative)"
-  | .nat      => "a JSON non-negative integer"
-  | .bool     => "a JSON boolean"
-  | .unit     => "null"
-  | .list t   => s!"a JSON array where each element is {t.toDescription}"
+partial def ResultType.toDescription : ResultType → String
+  | .string      => "a JSON string"
+  | .int         => "a JSON integer (may be negative)"
+  | .nat         => "a JSON non-negative integer"
+  | .bool        => "a JSON boolean"
+  | .unit        => "null"
+  | .list t      => s!"a JSON array where each element is {t.toDescription}"
+  | .mapping fs  =>
+      let fields := fs.map fun (k, t) => "\"" ++ k ++ "\": " ++ t.toDescription
+      "a JSON object with fields: {" ++ String.intercalate ", " fields ++ "}"
 
 /-- JSON Schema describing values of the given result type. -/
-def ResultType.toJsonSchema : ResultType → Json
-  | .string => Json.mkObj [("type", "string")]
-  | .int    => Json.mkObj [("type", "integer")]
-  | .nat    => Json.mkObj [("type", "integer")]
-  | .bool   => Json.mkObj [("type", "boolean")]
-  | .unit   => Json.mkObj [("type", "null")]
-  | .list t => Json.mkObj [("type", "array"), ("items", t.toJsonSchema)]
+partial def ResultType.toJsonSchema : ResultType → Json
+  | .string     => Json.mkObj [("type", "string")]
+  | .int        => Json.mkObj [("type", "integer")]
+  | .nat        => Json.mkObj [("type", "integer")]
+  | .bool       => Json.mkObj [("type", "boolean")]
+  | .unit       => Json.mkObj [("type", "null")]
+  | .list t     => Json.mkObj [("type", "array"), ("items", t.toJsonSchema)]
+  | .mapping fs =>
+      let props := Json.mkObj (fs.map fun (k, t) => (k, t.toJsonSchema))
+      let req   := Json.arr (fs.map (fun (k, _) => Json.str k) |>.toArray)
+      Json.mkObj [("type", "object"), ("properties", props), ("required", req)]
 
 /-- Serialize a value of the Lean type corresponding to `t` into JSON. -/
 partial def ResultType.valueToJson : (t : ResultType) → t.Type → Json
-  | .string, s => ToJson.toJson s
-  | .int, i    => ToJson.toJson i
-  | .nat, n    => ToJson.toJson n
-  | .bool, b   => ToJson.toJson b
-  | .unit, ()  => .null
-  | .list t, l => .arr (l.map (ResultType.valueToJson t) |>.toArray)
+  | .string, s    => ToJson.toJson s
+  | .int, i       => ToJson.toJson i
+  | .nat, n       => ToJson.toJson n
+  | .bool, b      => ToJson.toJson b
+  | .unit, ()     => .null
+  | .list t, l    => .arr (l.map (ResultType.valueToJson t) |>.toArray)
+  | .mapping _, j => j
 
 /-- Deserialize a JSON value into the Lean type corresponding to `t`. -/
 partial def ResultType.valueFromJson : (t : ResultType) → Json → Except String t.Type
-  | .string, j => FromJson.fromJson? j
-  | .int, j    => FromJson.fromJson? j
-  | .nat, j    => FromJson.fromJson? j
-  | .bool, j   => FromJson.fromJson? j
-  | .unit, _   => .ok ()
-  | .list t, j => do
+  | .string, j    => FromJson.fromJson? j
+  | .int, j       => FromJson.fromJson? j
+  | .nat, j       => FromJson.fromJson? j
+  | .bool, j      => FromJson.fromJson? j
+  | .unit, _      => .ok ()
+  | .list t, j    => do
       let arr ← j.getArr?
       arr.toList.mapM (ResultType.valueFromJson t)
+  | .mapping fs, j => do
+      let _ ← j.getObj?
+      for (key, t) in fs do
+        let v ← j.getObjVal? key
+        let _ ← ResultType.valueFromJson t v
+      return j
 
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where

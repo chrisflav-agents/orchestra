@@ -40,17 +40,20 @@ structure OutputSpec where
 
 /-- Task specification for a workflow step. -/
 structure TaskSpec where
-  agent    : Option String   := none
-  model    : Option String   := none
-  prompt   : String
-  readOnly : Bool            := false
-  input    : List VarRef     := []
-  output   : List OutputSpec := []
-  context  : Option String   := none
+  agent         : Option String   := none
+  model         : Option String   := none
+  prompt        : String
+  readOnly      : Bool            := false
+  input         : List VarRef     := []
+  output        : List OutputSpec := []
+  context       : Option String   := none
   /-- Override the program-level upstream repository for this step. -/
-  upstream : Option String   := none
+  upstream      : Option String   := none
   /-- Override the program-level fork repository for this step. -/
-  fork     : Option String   := none
+  fork          : Option String   := none
+  systemPrompt  : Option String   := none
+  prependPrompt : Option String   := none
+  backend       : Option String   := none
   deriving Repr
 
 /-- Specifies that a step iterates over a list. -/
@@ -154,26 +157,27 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       upstream, fork, mode := .fork
       prompt := spec.prompt ++ inputSection
       agent := spec.agent, model := spec.model, readOnly := spec.readOnly
+      systemPrompt := spec.systemPrompt, prependPrompt := spec.prependPrompt
+      backend := spec.backend
     }
     StateT.lift (run ioTask ())
   else
-    let schema := Json.mkObj (spec.output.map fun o => (o.name, o.type.toJsonSchema))
-    let outInstr := s!"\n\nReturn a JSON object with these fields:\n{schema.compress}"
-    let ioTask : IOTask .unit .string := {
+    let mappingFields := spec.output.map fun o => (o.name, o.type)
+    let outInstr := s!"\n\nCommunicate your result by calling the `submit_task_output` MCP tool with a JSON object matching this schema:\n{(ResultType.mapping mappingFields).toJsonSchema.compress}"
+    let ioTask : IOTask .unit (.mapping mappingFields) := {
       upstream, fork, mode := .fork
       prompt := spec.prompt ++ inputSection ++ outInstr
       agent := spec.agent, model := spec.model, readOnly := spec.readOnly
+      systemPrompt := spec.systemPrompt, prependPrompt := spec.prependPrompt
+      backend := spec.backend
     }
-    let result ← StateT.lift (run ioTask ())
-    match Json.parse result with
-    | .error _ => StateT.lift Concert.abort
-    | .ok j    =>
-      modify fun (env', ctrl) =>
-        let env'' := spec.output.foldl (fun acc ospec =>
-          match j.getObjVal? ospec.name with
-          | .ok v    => writeOutput stepName ospec v accumulate acc
-          | .error _ => acc) env'
-        (env'', ctrl)
+    let j ← StateT.lift (run ioTask ())
+    modify fun (env', ctrl) =>
+      let env'' := spec.output.foldl (fun acc ospec =>
+        match j.getObjVal? ospec.name with
+        | .ok v    => writeOutput stepName ospec v accumulate acc
+        | .error _ => acc) env'
+      (env'', ctrl)
 
 private def execWrite (varName : String) (op : WriteOp) : WorkflowM Unit :=
   modify fun (env, ctrl) =>

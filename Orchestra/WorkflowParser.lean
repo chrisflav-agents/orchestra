@@ -94,8 +94,11 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
   let readOnly :=
     (mappingLookup pairs "read-only").bind (nodeAsString · |>.toOption)
     |>.map (· == "true") |>.getD false
-  let upstream := (mappingLookup pairs "upstream").bind (nodeAsString · |>.toOption)
-  let fork     := (mappingLookup pairs "fork").bind     (nodeAsString · |>.toOption)
+  let upstream      := (mappingLookup pairs "upstream").bind       (nodeAsString · |>.toOption)
+  let fork          := (mappingLookup pairs "fork").bind           (nodeAsString · |>.toOption)
+  let systemPrompt  := (mappingLookup pairs "system-prompt").bind  (nodeAsString · |>.toOption)
+  let prependPrompt := (mappingLookup pairs "prepend-prompt").bind (nodeAsString · |>.toOption)
+  let backend       := (mappingLookup pairs "backend").bind        (nodeAsString · |>.toOption)
   let input ← match mappingLookup pairs "input" with
     | none      => pure []
     | some iNode => do
@@ -109,7 +112,8 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
         outPairs.toList.mapM fun (k, v) => do
           let name ← nodeAsString k
           parseOutputSpec name v
-  return { agent, model, prompt, readOnly, input, output, context, upstream, fork }
+  return { agent, model, prompt, readOnly, input, output, context, upstream, fork,
+           systemPrompt, prependPrompt, backend }
 
 private def parseWriteAction (node : Node) : Except String StepAction := do
   let s ← nodeAsString node
