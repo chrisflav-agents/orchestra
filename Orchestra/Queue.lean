@@ -78,6 +78,11 @@ structure QueueEntry where
   outputType    : ResultType     := .unit
   /-- Serialized task input, delivered via the `get_task_input` MCP tool. -/
   inputJson     : Option Json    := none
+  /-- When set, this entry is a concert launcher: the daemon evaluates the workflow
+      at this path via `Concert.evalQueued` instead of calling `TaskRunner.runTask`. -/
+  workflowFile  : Option String  := none
+  /-- Raw JSON string of workflow variable bindings for a concert launcher entry. -/
+  workflowVars  : Option String  := none
 
 instance : ToJson QueueEntry where
   toJson e :=
@@ -109,6 +114,8 @@ instance : ToJson QueueEntry where
     let fields := if e.inputType != .unit           then fields ++ [("input_type",       ToJson.toJson e.inputType)]   else fields
     let fields := if e.outputType != .unit          then fields ++ [("output_type",      ToJson.toJson e.outputType)]  else fields
     let fields := if let some j := e.inputJson      then fields ++ [("input_json",       j)]                           else fields
+    let fields := if let some s := e.workflowFile  then fields ++ [("workflow_file",    Json.str s)]                  else fields
+    let fields := if let some s := e.workflowVars  then fields ++ [("workflow_vars",    Json.str s)]                  else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -139,10 +146,12 @@ instance : FromJson QueueEntry where
     let inputType      := j.getObjValAs? ResultType "input_type"      |>.toOption |>.getD .unit
     let outputType     := j.getObjValAs? ResultType "output_type"     |>.toOption |>.getD .unit
     let inputJson      := j.getObjVal?   "input_json"                 |>.toOption
+    let workflowFile   := j.getObjValAs? String "workflow_file" |>.toOption
+    let workflowVars   := j.getObjValAs? String "workflow_vars" |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
-             concertStepKey, inputType, outputType, inputJson }
+             concertStepKey, inputType, outputType, inputJson, workflowFile, workflowVars }
 
 -- Directories and paths
 

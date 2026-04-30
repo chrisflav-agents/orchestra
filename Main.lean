@@ -299,7 +299,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
     IO.println entry.id
     return (0 : UInt32)
   | none, some taskFile =>
-    -- Workflow-file mode: validate and launch a background concert process.
+    -- Workflow-file mode: validate and enqueue a concert launcher entry for the daemon.
     if isWorkflowFile taskFile then
       let yaml ← IO.FS.readFile taskFile
       match Workflow.WorkflowProgram.parseYaml yaml with
@@ -307,27 +307,19 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         IO.eprintln s!"Failed to parse workflow: {e}"
         return 1
       | .ok _ =>
-        let exePath ← IO.appPath
-        let baseArgs := #["run", taskFile]
-        let args := match p.flag? "vars" |>.map (·.as! String) with
-          | none => baseArgs
-          | some v => baseArgs ++ #["--vars", v]
-        let logDir ← Queue.queueDir
-        IO.FS.createDirAll logDir
-        let logId ← TaskStore.generateId
-        let logFile := logDir / s!"concert-{logId}.log"
-        let quotedArgs := (args.map shellQuote).toList |> String.intercalate " "
-        let shellCmd :=
-          s!"exec {shellQuote exePath.toString} {quotedArgs} >> {shellQuote logFile.toString} 2>&1 &"
-        let launcher ← IO.Process.spawn {
-          cmd := "sh"
-          args := #["-c", shellCmd]
-          stdin := .null
-          stdout := .null
-          stderr := .null
+        let id ← TaskStore.generateId
+        let createdAt ← TaskStore.currentIso8601
+        let entry : Queue.QueueEntry := {
+          id, createdAt
+          upstream     := ""
+          fork         := ""
+          mode         := default
+          prompt       := ""
+          workflowFile := some taskFile
+          workflowVars := p.flag? "vars" |>.map (·.as! String)
         }
-        let _ ← launcher.wait
-        IO.println s!"Concert started, log: {logFile}"
+        Queue.saveEntry entry
+        IO.println id
         return 0
     -- Task-file mode: enqueue tasks from a JSON task file
     let taskFileData ← loadTaskFile taskFile
@@ -462,6 +454,22 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   -- Helper: run one queue entry to completion and update its status.
   -- Also signals the ConcertManager if the entry belongs to a concert.
   let runEntry (entry : Queue.QueueEntry) : IO Unit := do
+    -- Concert launcher: parse the workflow YAML and start a concert fiber via evalQueued.
+    if let some wfPath := entry.workflowFile then
+      let yaml ← IO.FS.readFile wfPath
+      match Workflow.WorkflowProgram.parseYaml yaml with
+      | .error e =>
+        IO.eprintln s!"Queue entry {entry.id}: workflow parse error: {e}"
+        Queue.saveEntry { entry with status := .failed }
+      | .ok prog =>
+        let initVars := (entry.workflowVars.map parseVarsJson).getD []
+        let concert := Workflow.WorkflowProgram.toConcert prog initVars
+        Queue.saveEntry { entry with status := .done }
+        IO.println s!"  Concert started from {wfPath}"
+        let _concertTask ← IO.asTask (prio := .dedicated) do
+          try Concert.evalQueued concertMgr appConfig debug none concert
+          catch e => IO.eprintln s!"  Concert failed: {e}"
+      return
     let taskToken ← Std.CancellationToken.new
     let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
     activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
