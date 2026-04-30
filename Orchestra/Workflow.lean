@@ -232,8 +232,10 @@ private partial def runSteps (prog : WorkflowProgram) : List Step → WorkflowM 
     let (_, ctrl) ← get
     if ctrl != .doExit then runSteps prog rest
 
-def WorkflowProgram.toConcert (prog : WorkflowProgram) : Concert Unit :=
-  let initEnv : Env := prog.variables.map fun (name, _) => (name, .null)
+def WorkflowProgram.toConcert (prog : WorkflowProgram)
+    (initVars : List (String × Json) := []) : Concert Unit :=
+  let initEnv : Env := prog.variables.map fun (name, _) =>
+    (name, (List.lookup name initVars).getD .null)
   StateT.run' (runSteps prog prog.steps) (initEnv, .normal)
 
 end Workflow

@@ -47,6 +47,11 @@ private def inheritSeries (continuesFrom : Option String) (series : Option Strin
 private def isWorkflowFile (path : String) : Bool :=
   path.endsWith ".yaml" || path.endsWith ".yml"
 
+private def parseVarsJson (s : String) : List (String × Lean.Json) :=
+  match Lean.Json.parse s with
+  | .error _ => []
+  | .ok j    => (j.getObj? |>.toOption |>.getD {}).toList
+
 private def runHandler (p : Parsed) : IO UInt32 := do
   let taskFile      := p.positionalArg! "task-file" |>.as! String
   let configPath    := p.flag? "config"    |>.map (·.as! String)
@@ -55,6 +60,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let continuesFrom := p.flag? "continues" |>.map (·.as! String)
   let series        := p.flag? "series"    |>.map (·.as! String)
   let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
+  let initVars      := p.flag? "vars"      |>.map (fun v => parseVarsJson (v.as! String)) |>.getD []
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   if isWorkflowFile taskFile then
     let yaml ← IO.FS.readFile taskFile
@@ -63,7 +69,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
       IO.eprintln s!"Failed to parse workflow: {e}"
       return 1
     | .ok prog =>
-      let concert := Workflow.WorkflowProgram.toConcert prog
+      let concert := Workflow.WorkflowProgram.toConcert prog initVars
       Concert.eval appConfig debug none concert
       return 0
   let taskFileData ← loadTaskFile taskFile
@@ -293,6 +299,36 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
     IO.println entry.id
     return (0 : UInt32)
   | none, some taskFile =>
+    -- Workflow-file mode: validate and launch a background concert process.
+    if isWorkflowFile taskFile then
+      let yaml ← IO.FS.readFile taskFile
+      match Workflow.WorkflowProgram.parseYaml yaml with
+      | .error e =>
+        IO.eprintln s!"Failed to parse workflow: {e}"
+        return 1
+      | .ok _ =>
+        let exePath ← IO.appPath
+        let baseArgs := #["run", taskFile]
+        let args := match p.flag? "vars" |>.map (·.as! String) with
+          | none => baseArgs
+          | some v => baseArgs ++ #["--vars", v]
+        let logDir ← Queue.queueDir
+        IO.FS.createDirAll logDir
+        let logId ← TaskStore.generateId
+        let logFile := logDir / s!"concert-{logId}.log"
+        let quotedArgs := (args.map shellQuote).toList |> String.intercalate " "
+        let shellCmd :=
+          s!"exec {shellQuote exePath.toString} {quotedArgs} >> {shellQuote logFile.toString} 2>&1 &"
+        let launcher ← IO.Process.spawn {
+          cmd := "sh"
+          args := #["-c", shellCmd]
+          stdin := .null
+          stdout := .null
+          stderr := .null
+        }
+        let _ ← launcher.wait
+        IO.println s!"Concert started, log: {logFile}"
+        return 0
     -- Task-file mode: enqueue tasks from a JSON task file
     let taskFileData ← loadTaskFile taskFile
     if taskFileData.tasks.isEmpty then
@@ -521,7 +557,8 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                     if r.isEmpty then vars.find? (·.1 == "fork") |>.map (·.2) |>.getD ""
                     else r
                   let prog := { prog with upstream, fork }
-                  let concert := Workflow.WorkflowProgram.toConcert prog
+                  let jsonVars := vars.map fun (k, v) => (k, Lean.Json.str v)
+                  let concert := Workflow.WorkflowProgram.toConcert prog jsonVars
                   IO.println s!"  Listener '{lcfg.name}': starting concert from {resolvedPath}"
                   let _concertTask ← IO.asTask (prio := .dedicated) do
                     try Concert.evalQueued concertMgr appConfig debug none concert
@@ -674,6 +711,7 @@ private def runCmd' : Cmd := `[Cli|
     continues : String; "Continue from a previous task by ID (requires --task with multi-task files)"
     series : String; "Assign this run to a named task series"
     budget : String; "Maximum spend in USD, overrides task file (default: 4.0)"
+    vars : String; "Initial workflow variable bindings as a JSON object, e.g. '{\"key\":\"value\"}' (workflow files only)"
 
   ARGS:
     "task-file" : String; "Path to the JSON task file"
@@ -752,7 +790,7 @@ private def resumeCmd : Cmd := `[Cli|
 
 private def queueAddCmd : Cmd := `[Cli|
   add VIA enqueueHandler; ["0.1.0"]
-  "Add tasks to the queue from a task file, or continue a series with a new prompt."
+  "Add tasks to the queue from a task file or workflow file, or continue a series with a new prompt."
 
   FLAGS:
     c, config : String; "Path to config file (default: ~/.agent/config.json)"
@@ -763,9 +801,10 @@ private def queueAddCmd : Cmd := `[Cli|
     p, prompt : String; "Prompt for the new agent run (used with --resume)"
     budget : String; "Maximum spend in USD, overrides task file (default: 4.0)"
     priority : Nat; "Priority for the queued entry (default: 10)"
+    vars : String; "Initial workflow variable bindings as a JSON object, e.g. '{\"key\":\"value\"}' (workflow files only)"
 
   ARGS:
-    ..."task-file" : String; "Path to the JSON task file (omit when using --resume)"
+    ..."task-file" : String; "Path to the JSON task or workflow file (omit when using --resume)"
 ]
 
 private def queueStartCmd : Cmd := `[Cli|
