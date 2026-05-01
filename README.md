@@ -184,6 +184,31 @@ Group runs into a named series for later resumption:
 orchestra run --series my-series tasks.json
 ```
 
+## concert workflows
+
+Workflows are YAML files that describe a multi-step agent program. Steps run
+sequentially; later steps can receive typed outputs from earlier ones. The
+workflow is compiled to a _Concert_ program and evaluated step by step.
+
+Pass a `.yaml` file directly to `run`:
+
+```
+orchestra run workflow.yaml
+```
+
+Pass initial variable values with `--vars`:
+
+```
+orchestra run --vars '{"difficulty": 5}' workflow.yaml
+```
+
+See `docs/workflow.md` for the full workflow DSL reference and
+`examples/concerts/` for ready-made examples:
+
+- `examples/concerts/sequence.yaml` — plan / implement / review pipeline
+- `examples/concerts/loop.yaml` — for-each loop with typed outputs
+- `examples/concerts/conditionals.yaml` — conditional exit on difficulty score
+
 ## task history
 
 ```
@@ -214,6 +239,13 @@ Add tasks to the queue:
 ```
 orchestra queue add tasks.json
 orchestra queue add --resume my-series --prompt "Next step."
+```
+
+Add a workflow (concert) to the queue:
+
+```
+orchestra queue add workflow.yaml
+orchestra queue add --vars '{"key": "value"}' workflow.yaml
 ```
 
 Show the queue:
@@ -286,6 +318,30 @@ Fields:
 - `source.trigger` — only events whose body contains this string are processed
 - `source.authorized_users` — list of GitHub logins that may trigger the listener; empty means allow everyone
 - `action.prompt_template` — template rendered with event variables (e.g. `{{upstream}}`, `{{fork}}`, `{{issue_number}}`, `{{body}}`, `{{author}}`)
+- `action.workflow_path` — path to a `.yaml` workflow file; when set the listener starts a concert instead of enqueueing a single task
+
+To trigger a multi-step workflow from a listener, replace `prompt_template` with `workflow_path`:
+
+```json
+{
+  "name": "issue-workflow",
+  "source": {
+    "type": "github-issues",
+    "repos": [{"upstream": "owner/repo", "fork": "your-org/fork"}],
+    "trigger": "@orchestra",
+    "authorized_users": ["alice"]
+  },
+  "action": {
+    "upstream": "{{upstream}}",
+    "fork": "{{fork}}",
+    "mode": "fork",
+    "workflow_path": "/path/to/workflow.yaml"
+  },
+  "interval_seconds": 120
+}
+```
+
+See `examples/listeners/` for further listener examples.
 
 ## other commands
 
