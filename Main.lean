@@ -299,29 +299,40 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
     IO.println entry.id
     return (0 : UInt32)
   | none, some taskFile =>
-    -- Workflow-file mode: spawn a concert runner process so each step enters the queue as
-    -- an individual task entry.  No concert launcher entry is created in the queue.
+    -- Workflow-file mode: write a concert entry to the queue; the daemon picks it up and
+    -- starts a concert fiber using its ConcertManager.
+    -- TODO: Replace this file-based IPC with a Unix domain socket so `queue add` can
+    -- communicate with the running daemon directly, enabling immediate error reporting
+    -- and removing the need for a polling-based or file-drop protocol.
     if isWorkflowFile taskFile then
       let yaml ← IO.FS.readFile taskFile
       match Workflow.WorkflowProgram.parseYaml yaml with
       | .error e =>
         IO.eprintln s!"Failed to parse workflow: {e}"
         return 1
-      | .ok _ =>
-        let exePath ← IO.appPath
-        let varsArg := p.flag? "vars" |>.map (·.as! String)
-        let args :=
-          #["queue", "concert", taskFile] ++
-          (match configPath with | some c => #["--config", c] | none => #[]) ++
-          (match varsArg    with | some v => #["--vars",   v] | none => #[])
-        let _ ← IO.Process.spawn {
-          cmd    := exePath.toString
-          args
-          stdin  := .null
-          stdout := .null
-          stderr := .null
+      | .ok prog =>
+        -- Resolve to absolute path so the daemon can find the file regardless of its
+        -- working directory (it may be started from a different location than queue add).
+        let absTaskFile ← do
+          let p := System.FilePath.mk taskFile
+          if p.isAbsolute then pure taskFile
+          else pure ((← IO.currentDir) / taskFile |>.toString)
+        let vars := p.flag? "vars" |>.map (fun v => parseVarsJson (v.as! String)) |>.getD []
+        let id ← TaskStore.generateId
+        let createdAt ← TaskStore.currentIso8601
+        let entry : Queue.QueueEntry := {
+          id, createdAt
+          workflowFile := some absTaskFile
+          workflowVars := if vars.isEmpty then none else some (Lean.Json.mkObj vars)
+          configPath
+          -- Store upstream/fork from the workflow so they are visible in queue status.
+          upstream := prog.upstream
+          fork     := prog.fork
+          mode     := .fork
+          prompt   := ""
         }
-        IO.println s!"Concert started from {taskFile}"
+        Queue.saveEntry entry
+        IO.println entry.id
         return 0
     -- Task-file mode: enqueue tasks from a JSON task file
     let taskFileData ← loadTaskFile taskFile
@@ -489,10 +500,14 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         (continuesFrom := entry.continuesFrom) (series := entry.series)
         (cancelToken := some taskToken) (interactive := false)
       removeToken
-      if ← taskToken.isCancelled then
+      -- The sandbox always cancels taskToken with `.custom "done"` on normal exit, so
+      -- `isCancelled` is true for both normal completion and watcher-triggered cancellation.
+      -- Check the reason to distinguish the two cases.
+      let explicitlyCancelled := (← taskToken.getCancellationReason) == some .cancel
+      if explicitlyCancelled then
         Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
         IO.println s!"  Task cancelled."
-        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") outputJson
       else if usageLimitHit then
         Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
         Queue.cancelPendingByBackend entry.backend entry.id
@@ -505,7 +520,8 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           ConcertManager.signal concertMgr key outputJson
     catch e =>
       removeToken
-      if ← taskToken.isCancelled then
+      let explicitlyCancelled := (← taskToken.getCancellationReason) == some .cancel
+      if explicitlyCancelled then
         IO.eprintln s!"  Task cancelled (with error: {e})"
         try Queue.saveEntry { entry with status := .cancelled } catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
@@ -580,25 +596,44 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
     while !(← shutdownToken.isCancelled) do
       match ← claimNextEntry with
       | none       => IO.sleep 1000
-      | some entry => runEntry entry
+      | some entry =>
+        if let some wfPath := entry.workflowFile then
+          -- Concert entry: parse the workflow and start a fiber; do not block the worker loop.
+          let launch : IO Unit := do
+            let yaml ← IO.FS.readFile wfPath
+            match Workflow.WorkflowProgram.parseYaml yaml with
+            | .error e =>
+              IO.eprintln s!"  Concert {entry.id}: workflow parse error: {e}"
+              Queue.saveEntry { entry with status := .failed }
+            | .ok prog =>
+              let vars : List (String × Lean.Json) :=
+                entry.workflowVars
+                  |>.bind (·.getObj?.toOption)
+                  |>.map (·.toList)
+                  |>.getD []
+              let cfg ← match entry.configPath with
+                | none    => pure appConfig
+                | some cp => loadAppConfig (some (System.FilePath.mk cp))
+              let concert := Workflow.WorkflowProgram.toConcert prog vars
+              IO.println s!"  Concert {entry.id}: starting from {wfPath}"
+              let _concertTask ← IO.asTask (prio := .dedicated) <| do
+                try
+                  Concert.evalQueued concertMgr cfg debug none concert
+                  Queue.saveEntry { entry with status := .done }
+                catch e =>
+                  IO.eprintln s!"  Concert {entry.id} failed: {e}"
+                  try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+          try launch
+          catch e =>
+            IO.eprintln s!"  Concert {entry.id} failed to start: {e}"
+            try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+        else
+          runEntry entry
   finally
     ConcertManager.cancelAll concertMgr
     Queue.deletePid
   IO.println "Queue daemon shut down gracefully."
   return 0
-
-private def queueConcertHandler (p : Parsed) : IO UInt32 := do
-  let taskFile := p.positionalArg! "workflow-file" |>.as! String
-  let initVars := p.flag? "vars" |>.map (fun v => parseVarsJson (v.as! String)) |>.getD []
-  let yaml ← IO.FS.readFile taskFile
-  match Workflow.WorkflowProgram.parseYaml yaml with
-  | .error e =>
-    IO.eprintln s!"Failed to parse workflow: {e}"
-    return 1
-  | .ok prog =>
-    let concert := Workflow.WorkflowProgram.toConcert prog initVars
-    Concert.evalQueuedPolling concert
-    return 0
 
 private def queueListHandler (p : Parsed) : IO UInt32 := do
   let limit := p.flag? "limit" |>.map (·.as! Nat) |>.getD 20
@@ -891,17 +926,6 @@ private def queueRetryCmd : Cmd := `[Cli|
     series : String; "Only retry entries belonging to this series"
 ]
 
-private def queueConcertCmd : Cmd := `[Cli|
-  concert VIA queueConcertHandler; ["0.1.0"]
-  "Run a workflow concert, submitting each step to the queue daemon as an individual task."
-
-  FLAGS:
-    vars : String; "Initial workflow variable bindings as a JSON object, e.g. '{\"key\":\"value\"}'"
-
-  ARGS:
-    "workflow-file" : String; "Path to the workflow YAML file"
-]
-
 private def queueListenersCmd : Cmd := `[Cli|
   listeners VIA queueListenersHandler; ["0.1.0"]
   "List configured listeners and their polling state."
@@ -919,7 +943,6 @@ private def queueCmd : Cmd := `[Cli|
 
   SUBCOMMANDS:
     queueAddCmd;
-    queueConcertCmd;
     queueStartCmd;
     queueStatusCmd;
     queueShutdownCmd;

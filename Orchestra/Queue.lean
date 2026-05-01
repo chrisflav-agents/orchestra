@@ -72,6 +72,11 @@ structure QueueEntry where
   /-- Key linking this entry to a suspended concert fiber. When set, the queue
       daemon signals the ConcertManager with the task output after completion. -/
   concertStepKey : Option String := none
+  /-- Path to a workflow YAML file. When set, the daemon starts a concert fiber
+      instead of running a regular agent task. -/
+  workflowFile   : Option String := none
+  /-- Initial variable bindings for the concert, serialized as a JSON object. -/
+  workflowVars   : Option Json   := none
   /-- Input type for the task. Controls which MCP tools are exposed. -/
   inputType     : ResultType     := .unit
   /-- Output type for the task. Controls which MCP tools are exposed. -/
@@ -108,6 +113,8 @@ instance : ToJson QueueEntry where
     let fields := if e.readOnly                    then fields ++ [("read_only",        Json.bool true)]  else fields
     let fields := if e.priority != 10              then fields ++ [("priority",         Json.num e.priority)]           else fields
     let fields := if let some s := e.concertStepKey then fields ++ [("concert_step_key", Json.str s)]                  else fields
+    let fields := if let some s := e.workflowFile   then fields ++ [("workflow_file",    Json.str s)]                  else fields
+    let fields := if let some j := e.workflowVars   then fields ++ [("workflow_vars",    j)]                           else fields
     let fields := if e.inputType != .unit           then fields ++ [("input_type",       ToJson.toJson e.inputType)]   else fields
     let fields := if e.outputType != .unit          then fields ++ [("output_type",      ToJson.toJson e.outputType)]  else fields
     let fields := if let some j := e.inputJson      then fields ++ [("input_json",       j)]                           else fields
@@ -143,10 +150,13 @@ instance : FromJson QueueEntry where
     let outputType     := j.getObjValAs? ResultType "output_type"     |>.toOption |>.getD .unit
     let inputJson      := j.getObjVal?   "input_json"  |>.toOption
     let outputJson     := j.getObjVal?   "output_json" |>.toOption
+    let workflowFile   := j.getObjValAs? String "workflow_file" |>.toOption
+    let workflowVars   := j.getObjVal?   "workflow_vars"        |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
-             concertStepKey, inputType, outputType, inputJson, outputJson }
+             concertStepKey, inputType, outputType, inputJson, outputJson,
+             workflowFile, workflowVars }
 
 -- Directories and paths
 
@@ -301,7 +311,8 @@ def markStaleRunningAsUnfinished : IO Unit := do
 def cancelStaleConcertEntries : IO Unit := do
   let all ← loadAllEntries
   for entry in all do
-    if entry.status == .unfinished && entry.concertStepKey.isSome then
+    if entry.status == .unfinished &&
+        (entry.concertStepKey.isSome || entry.workflowFile.isSome) then
       saveEntry { entry with status := .cancelled }
 
 end Orchestra.Queue
