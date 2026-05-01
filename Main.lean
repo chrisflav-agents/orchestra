@@ -264,7 +264,7 @@ private def getOwnPid : IO UInt32 := do
     Throws if the daemon returns an "error" field. -/
 private def daemonRequest (req : Lean.Json) : IO Lean.Json := do
   let socketPath ← Queue.socketFile
-  let conn ← UnixSocket.Connection.connect socketPath
+  let conn ← Utils.UnixSocket.Connection.connect socketPath
   conn.sendLine req.compress
   let line ← conn.recvLine
   conn.close
@@ -396,7 +396,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
     return (0 : UInt32)
 
 private def handleSocketRequest
-    (conn             : UnixSocket.Connection)
+    (conn             : Utils.UnixSocket.Connection)
     (appConfig        : Orchestra.AppConfig)
     (concertMgr       : ConcertManager.ConcertManager)
     (debug            : Bool)
@@ -405,78 +405,65 @@ private def handleSocketRequest
     : IO Unit := do
   try
     let line ← conn.recvLine
-    let response ← match Lean.Json.parse line with
-      | .error e => pure (Lean.Json.mkObj [("error", s!"invalid JSON: {e}")])
-      | .ok req  => do
-        let reqType := req.getObjValAs? String "type" |>.toOption |>.getD ""
-        match reqType with
-        | "add_task" =>
-          match req.getObjVal? "entry" |>.toOption with
-          | none => pure (Lean.Json.mkObj [("error", "missing entry field")])
-          | some entryJson =>
-            match (Lean.FromJson.fromJson? entryJson : Except String Queue.QueueEntry) with
-            | .error e => pure (Lean.Json.mkObj [("error", s!"invalid entry: {e}")])
-            | .ok entry =>
-              Queue.saveEntry entry
-              pure (Lean.Json.mkObj [("id", entry.id)])
-        | "add_concert" =>
-          let wfFile  := req.getObjValAs? String "workflow_file" |>.toOption
-          let vars    := req.getObjVal? "vars" |>.toOption
-          let cfgPath := req.getObjValAs? String "config_path"  |>.toOption
-          match wfFile with
-          | none => pure (Lean.Json.mkObj [("error", "missing workflow_file")])
-          | some wfPath =>
-            let result : Except String Lean.Json ← try
-              let yaml ← IO.FS.readFile wfPath
-              match Workflow.WorkflowProgram.parseYaml yaml with
-              | .error e => pure (Except.error s!"workflow parse failed: {e}")
-              | .ok prog =>
-                let concertId ← TaskStore.generateId
-                let varsList := vars
-                  |>.bind (·.getObj?.toOption)
-                  |>.map (·.toList)
-                  |>.getD []
-                let cfg ← match cfgPath with
-                  | none    => pure appConfig
-                  | some cp => loadAppConfig (some (System.FilePath.mk cp))
-                let concert := Workflow.WorkflowProgram.toConcert prog varsList
-                let run : Queue.ConcertRun := {
-                  id           := concertId
-                  startedAt    := ← TaskStore.currentIso8601
-                  name         := if prog.name.isEmpty then none else some prog.name
-                  workflowFile := some wfPath
-                }
-                Queue.saveConcertRun run
-                IO.println s!"  Concert {concertId}: starting from {wfPath}"
-                let _concertTask ← IO.asTask (prio := .dedicated) do
-                  try
-                    Concert.evalQueued concertMgr cfg debug none (some concertId) concert
-                    let t ← TaskStore.currentIso8601
-                    Queue.saveConcertRun { run with status := .done, finishedAt := some t }
-                  catch e =>
-                    IO.eprintln s!"  Concert {concertId} failed: {e}"
-                    let t ← TaskStore.currentIso8601
-                    Queue.saveConcertRun { run with status := .failed, finishedAt := some t }
-                pure (Except.ok (Lean.Json.mkObj [("id", concertId)]))
-            catch e => pure (Except.error s!"failed to start concert: {e}")
-            match result with
-            | .ok j    => pure j
-            | .error e => pure (Lean.Json.mkObj [("error", e)])
-        | "cancel" =>
+    let response : DaemonRequest.DaemonResponse ← match Lean.Json.parse line with
+      | .error e => pure (.error s!"invalid JSON: {e}")
+      | .ok j    =>
+        match (Lean.FromJson.fromJson? j : Except String DaemonRequest.DaemonRequest) with
+        | .error e => pure (.error s!"invalid request: {e}")
+        | .ok msg  => match msg with
+        | .addTask entry =>
+          Queue.saveEntry entry
+          pure (.withId entry.id)
+        | .addConcert wfPath vars cfgPath =>
+          let result : Except String String ← try
+            let yaml ← IO.FS.readFile wfPath
+            match Workflow.WorkflowProgram.parseYaml yaml with
+            | .error e => pure (Except.error s!"workflow parse failed: {e}")
+            | .ok prog =>
+              let concertId ← TaskStore.generateId
+              let varsList := vars
+                |>.bind (·.getObj?.toOption)
+                |>.map (·.toList)
+                |>.getD []
+              let cfg ← match cfgPath with
+                | none    => pure appConfig
+                | some cp => loadAppConfig (some (System.FilePath.mk cp))
+              let concert := Workflow.WorkflowProgram.toConcert prog varsList
+              let run : Queue.ConcertRun := {
+                id           := concertId
+                startedAt    := ← TaskStore.currentIso8601
+                name         := if prog.name.isEmpty then none else some prog.name
+                workflowFile := some wfPath
+              }
+              Queue.saveConcertRun run
+              IO.println s!"  Concert {concertId}: starting from {wfPath}"
+              let _concertTask ← IO.asTask (prio := .dedicated) do
+                try
+                  Concert.evalQueued concertMgr cfg debug none (some concertId) concert
+                  let t ← TaskStore.currentIso8601
+                  Queue.saveConcertRun { run with status := .done, finishedAt := some t }
+                catch e =>
+                  IO.eprintln s!"  Concert {concertId} failed: {e}"
+                  let t ← TaskStore.currentIso8601
+                  Queue.saveConcertRun { run with status := .failed, finishedAt := some t }
+              pure (Except.ok concertId)
+          catch e => pure (Except.error s!"failed to start concert: {e}")
+          match result with
+          | .ok id   => pure (.withId id)
+          | .error e => pure (.error e)
+        | .cancel =>
           let pairs ← activeTaskTokens.atomically (·.get)
           for (_, token) in pairs do
             token.cancel .cancel
-          pure (Lean.Json.mkObj [("ok", Lean.Json.bool true)])
-        | "shutdown" =>
-          let force := req.getObjValAs? Bool "force" |>.toOption |>.getD false
+          pure DaemonRequest.DaemonResponse.ok
+        | .shutdown force =>
           if force then
             let pairs ← activeTaskTokens.atomically (·.get)
             for (_, token) in pairs do
               token.cancel .cancel
           shutdownToken.cancel .shutdown
-          pure (Lean.Json.mkObj [("ok", Lean.Json.bool true)])
-        | t => pure (Lean.Json.mkObj [("error", s!"unknown request type: {t}")])
-    conn.sendLine response.compress
+          pure DaemonRequest.DaemonResponse.ok
+    conn.sendLine (Lean.ToJson.toJson response).compress
   catch e =>
     IO.eprintln s!"Socket request error: {e}"
   try conn.close catch _ => pure ()
@@ -548,11 +535,11 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   let concertMgr ← ConcertManager.new
   -- Socket server: receives control requests (add_task, add_concert, cancel, shutdown).
   let socketPath ← Queue.socketFile
-  try UnixSocket.Server.unlink socketPath catch _ => pure ()
-  let socketServerRef ← IO.mkRef (none : Option UnixSocket.Server)
+  try Utils.UnixSocket.Server.unlink socketPath catch _ => pure ()
+  let socketServerRef ← IO.mkRef (none : Option Utils.UnixSocket.Server)
   let _socketTask ← IO.asTask (prio := .dedicated) do
     try
-      let server ← UnixSocket.Server.listen socketPath
+      let server ← Utils.UnixSocket.Server.listen socketPath
       socketServerRef.set (some server)
       repeat do
         let conn ← server.accept
@@ -719,7 +706,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
     match ← socketServerRef.get with
     | some s => try s.close catch _ => pure ()
     | none   => pure ()
-    try UnixSocket.Server.unlink socketPath catch _ => pure ()
+    try Utils.UnixSocket.Server.unlink socketPath catch _ => pure ()
     ConcertManager.cancelAll concertMgr
     Queue.deletePid
   IO.println "Queue daemon shut down gracefully."

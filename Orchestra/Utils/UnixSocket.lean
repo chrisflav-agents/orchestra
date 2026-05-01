@@ -3,7 +3,7 @@ Unix domain socket bindings for intra-machine IPC between the queue daemon and C
 The API is intentionally minimal: one line-delimited JSON round-trip per connection.
 -/
 
-namespace Orchestra.UnixSocket
+namespace Orchestra.Utils.UnixSocket
 
 -- Low-level FFI bindings
 
@@ -66,4 +66,4 @@ def close (c : Connection) : IO Unit := udsClose c.fd
 
 end Connection
 
-end Orchestra.UnixSocket
+end Orchestra.Utils.UnixSocket
