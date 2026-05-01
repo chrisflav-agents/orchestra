@@ -146,13 +146,23 @@ private def tasksHandler (p : Parsed) : IO UInt32 := do
   if records.isEmpty then
     IO.println "No tasks found."
     return (0 : UInt32)
-  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 11} SERIES"
-  IO.println (String.ofList (List.replicate 90 '-'))
+  let queueEntries ← Queue.loadAllEntries
+  let allConcerts ← Queue.loadAllConcertRuns
+  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 11} CONCERT"
+  IO.println (String.ofList (List.replicate 100 '-'))
   for r in records do
     let status := match r.status with
       | .running => "running" | .completed => "completed" | .failed => "failed"
       | .unfinished => "unfinished" | .cancelled => "cancelled"
-    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork 28} {padRight status 11} {r.series.getD ""}"
+    let concertLabel :=
+      let mConcert : Option Queue.ConcertRun := do
+        let e ← queueEntries.find? (fun e => e.taskId == some r.id)
+        let cid ← e.concertId
+        allConcerts.find? (fun cr => cr.id == cid)
+      match mConcert with
+      | some run => run.name.getD run.id
+      | none     => r.series.getD ""
+    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork 28} {padRight status 11} {concertLabel}"
   return (0 : UInt32)
 
 private def taskShowHandler (p : Parsed) : IO UInt32 := do
@@ -421,7 +431,7 @@ private def handleSocketRequest
               match Workflow.WorkflowProgram.parseYaml yaml with
               | .error e => pure (Except.error s!"workflow parse failed: {e}")
               | .ok prog =>
-                let id ← TaskStore.generateId
+                let concertId ← TaskStore.generateId
                 let varsList := vars
                   |>.bind (·.getObj?.toOption)
                   |>.map (·.toList)
@@ -430,11 +440,24 @@ private def handleSocketRequest
                   | none    => pure appConfig
                   | some cp => loadAppConfig (some (System.FilePath.mk cp))
                 let concert := Workflow.WorkflowProgram.toConcert prog varsList
-                IO.println s!"  Concert {id}: starting from {wfPath}"
+                let run : Queue.ConcertRun := {
+                  id           := concertId
+                  startedAt    := ← TaskStore.currentIso8601
+                  name         := if prog.name.isEmpty then none else some prog.name
+                  workflowFile := some wfPath
+                }
+                Queue.saveConcertRun run
+                IO.println s!"  Concert {concertId}: starting from {wfPath}"
                 let _concertTask ← IO.asTask (prio := .dedicated) do
-                  try Concert.evalQueued concertMgr cfg debug none concert
-                  catch e => IO.eprintln s!"  Concert {id} failed: {e}"
-                pure (Except.ok (Lean.Json.mkObj [("id", id)]))
+                  try
+                    Concert.evalQueued concertMgr cfg debug none (some concertId) concert
+                    let t ← TaskStore.currentIso8601
+                    Queue.saveConcertRun { run with status := .done, finishedAt := some t }
+                  catch e =>
+                    IO.eprintln s!"  Concert {concertId} failed: {e}"
+                    let t ← TaskStore.currentIso8601
+                    Queue.saveConcertRun { run with status := .failed, finishedAt := some t }
+                pure (Except.ok (Lean.Json.mkObj [("id", concertId)]))
             catch e => pure (Except.error s!"failed to start concert: {e}")
             match result with
             | .ok j    => pure j
@@ -512,6 +535,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   -- Startup cleanup
   Queue.markStaleRunningAsUnfinished
   Queue.cancelStaleConcertEntries
+  Queue.cancelStaleRunningConcerts
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
@@ -650,9 +674,23 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                   let jsonVars := vars.map fun (k, v) => (k, Lean.Json.str v)
                   let concert := Workflow.WorkflowProgram.toConcert prog jsonVars
                   IO.println s!"  Listener '{lcfg.name}': starting concert from {resolvedPath}"
+                  let concertId ← TaskStore.generateId
+                  let concertRun : Queue.ConcertRun := {
+                    id           := concertId
+                    startedAt    := ← TaskStore.currentIso8601
+                    name         := if prog.name.isEmpty then none else some prog.name
+                    workflowFile := some resolvedPath
+                  }
+                  Queue.saveConcertRun concertRun
                   let _concertTask ← IO.asTask (prio := .dedicated) do
-                    try Concert.evalQueued concertMgr appConfig debug none concert
-                    catch e => IO.eprintln s!"  Concert failed: {e}"
+                    try
+                      Concert.evalQueued concertMgr appConfig debug none (some concertId) concert
+                      let t ← TaskStore.currentIso8601
+                      Queue.saveConcertRun { concertRun with status := .done, finishedAt := some t }
+                    catch e =>
+                      IO.eprintln s!"  Concert {concertId} failed: {e}"
+                      let t ← TaskStore.currentIso8601
+                      Queue.saveConcertRun { concertRun with status := .failed, finishedAt := some t }
                   pure ()
               catch e =>
                 IO.eprintln s!"  Listener '{lcfg.name}': failed to load workflow: {e}"
@@ -695,18 +733,33 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
     | none     => IO.println "Daemon running"
   else
     IO.println "Daemon not running"
+  -- Concert run history
+  let concertRuns := (← Queue.loadAllConcertRuns).toList.take limit
+  if !concertRuns.isEmpty then
+    IO.println ""
+    IO.println s!"{padRight "CONCERT ID" 16} {padRight "STARTED" 20} {padRight "STATUS" 9} NAME"
+    IO.println (String.ofList (List.replicate 80 '-'))
+    for r in concertRuns do
+      let status := match r.status with
+        | .running => "running" | .done => "done" | .failed => "failed" | .cancelled => "cancelled"
+      IO.println s!"{padRight r.id 16} {padRight r.startedAt 20} {padRight status 9} {r.name.getD (r.workflowFile.getD "")}"
+  -- Queue entries
   let entries := (← Queue.loadAllEntries).toList.take limit
   if entries.isEmpty then
     IO.println "No queue entries found."
     return (0 : UInt32)
   IO.println ""
-  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 9} PRIORITY SERIES"
+  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 9} {padRight "PRI" 4} CONCERT"
   IO.println (String.ofList (List.replicate 93 '-'))
+  let allConcerts ← Queue.loadAllConcertRuns
   for e in entries do
     let status := match e.status with
       | .pending => "pending" | .running => "running" | .done => "done" | .failed => "failed"
       | .unfinished => "unfinished" | .cancelled => "cancelled"
-    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork 28} {padRight status 10} {padRight (toString e.priority) 8} {e.series.getD ""}"
+    let concertLabel := match e.concertId.bind (fun cid => allConcerts.find? (fun cr => cr.id == cid)) with
+      | some r => r.name.getD r.id
+      | none   => e.series.getD ""
+    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork 28} {padRight status 10} {padRight (toString e.priority) 4} {concertLabel}"
   return (0 : UInt32)
 
 private def queueListenersHandler (p : Parsed) : IO UInt32 := do
@@ -736,23 +789,38 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
     | none     => IO.println "Daemon: running"
   else
     IO.println "Daemon: not running"
+  -- Running concerts
+  let allConcerts ← Queue.loadAllConcertRuns
+  let runningConcerts := allConcerts.filter (fun r => r.status == .running)
+  if !runningConcerts.isEmpty then
+    IO.println ""
+    IO.println s!"Concerts: {runningConcerts.size} running"
+    IO.println ""
+    IO.println s!"{padRight "ID" 16} {padRight "STARTED" 20} NAME"
+    IO.println (String.ofList (List.replicate 60 '-'))
+    for r in runningConcerts do
+      IO.println s!"{padRight r.id 16} {padRight r.startedAt 20} {r.name.getD (r.workflowFile.getD "")}"
   -- Running and pending entries only
   let all ← Queue.loadAllEntries
   let active := all.filter (fun e => e.status == .running || e.status == .pending)
   if active.isEmpty then
     IO.println "Queue: empty"
   else
+    IO.println ""
     IO.println s!"Queue: {active.size} task(s)"
     IO.println ""
-    IO.println s!"{padRight "ID" 16} {padRight "FORK" 32} {padRight "STATUS" 9} PRIORITY SERIES"
-    IO.println (String.ofList (List.replicate 78 '-'))
+    IO.println s!"{padRight "ID" 16} {padRight "FORK" 28} {padRight "STATUS" 9} {padRight "PRIORITY" 8} CONCERT"
+    IO.println (String.ofList (List.replicate 85 '-'))
     -- Show running first, then pending ordered by priority desc, then oldest first
     let running := active.filter (fun e => e.status == .running)
     let pendingArr := active.filter (fun e => e.status == .pending)
     let pendingByPriority := pendingArr.qsort (fun a b => a.priority > b.priority)
     for e in running ++ pendingByPriority do
       let status := if e.status == .running then "running" else "pending"
-      IO.println s!"{padRight e.id 16} {padRight e.fork 32} {padRight status 9} {padRight (toString e.priority) 8} {e.series.getD ""}"
+      let concertLabel := match e.concertId.bind (fun cid => allConcerts.find? (fun cr => cr.id == cid)) with
+        | some r => r.name.getD r.id
+        | none   => ""
+      IO.println s!"{padRight e.id 16} {padRight e.fork 28} {padRight status 9} {padRight (toString e.priority) 8} {concertLabel}"
   -- Listener status
   let listenerConfigs ← Listener.loadAllListenerConfigs (← Listener.listenersDir)
   if !listenerConfigs.isEmpty then

@@ -38,6 +38,52 @@ instance : FromJson QueueStatus where
     | .str "cancelled"  => .ok .cancelled
     | j => .error s!"expected queue status string, got {j}"
 
+-- Concert run tracking
+
+inductive ConcertStatus where
+  | running | done | failed | cancelled
+  deriving Repr, BEq
+
+instance : ToJson ConcertStatus where
+  toJson | .running => "running" | .done => "done" | .failed => "failed" | .cancelled => "cancelled"
+
+instance : FromJson ConcertStatus where
+  fromJson?
+    | .str "running"   => .ok .running
+    | .str "done"      => .ok .done
+    | .str "failed"    => .ok .failed
+    | .str "cancelled" => .ok .cancelled
+    | j => .error s!"expected concert status, got {j}"
+
+structure ConcertRun where
+  id           : String
+  startedAt    : String
+  status       : ConcertStatus := .running
+  name         : Option String := none
+  workflowFile : Option String := none
+  finishedAt   : Option String := none
+
+instance : ToJson ConcertRun where
+  toJson r :=
+    let fields : List (String × Json) := [("id", r.id), ("started_at", r.startedAt),
+      ("status", ToJson.toJson r.status)]
+    let fields := if let some n := r.name         then fields ++ [("name",          Json.str n)] else fields
+    let fields := if let some f := r.workflowFile then fields ++ [("workflow_file", Json.str f)] else fields
+    let fields := if let some t := r.finishedAt   then fields ++ [("finished_at",   Json.str t)] else fields
+    Json.mkObj fields
+
+instance : FromJson ConcertRun where
+  fromJson? j := do
+    let id          ← j.getObjValAs? String "id"
+    let startedAt   ← j.getObjValAs? String "started_at"
+    let status      ← j.getObjValAs? ConcertStatus "status"
+    let name         := j.getObjValAs? String "name"          |>.toOption
+    let workflowFile := j.getObjValAs? String "workflow_file" |>.toOption
+    let finishedAt   := j.getObjValAs? String "finished_at"   |>.toOption
+    return { id, startedAt, status, name, workflowFile, finishedAt }
+
+-- Queue entries
+
 structure QueueEntry where
   id            : String
   createdAt     : String
@@ -72,6 +118,8 @@ structure QueueEntry where
   /-- Key linking this entry to a suspended concert fiber. When set, the queue
       daemon signals the ConcertManager with the task output after completion. -/
   concertStepKey : Option String := none
+  /-- ID of the concert run that created this step entry. -/
+  concertId     : Option String := none
   /-- Input type for the task. Controls which MCP tools are exposed. -/
   inputType     : ResultType     := .unit
   /-- Output type for the task. Controls which MCP tools are exposed. -/
@@ -108,6 +156,7 @@ instance : ToJson QueueEntry where
     let fields := if e.readOnly                    then fields ++ [("read_only",        Json.bool true)]  else fields
     let fields := if e.priority != 10              then fields ++ [("priority",         Json.num e.priority)]           else fields
     let fields := if let some s := e.concertStepKey then fields ++ [("concert_step_key", Json.str s)]                  else fields
+    let fields := if let some s := e.concertId      then fields ++ [("concert_id",       Json.str s)]                  else fields
     let fields := if e.inputType != .unit           then fields ++ [("input_type",       ToJson.toJson e.inputType)]   else fields
     let fields := if e.outputType != .unit          then fields ++ [("output_type",      ToJson.toJson e.outputType)]  else fields
     let fields := if let some j := e.inputJson      then fields ++ [("input_json",       j)]                           else fields
@@ -139,6 +188,7 @@ instance : FromJson QueueEntry where
     let readOnly      := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let priority       := j.getObjValAs? Nat        "priority"         |>.toOption |>.getD 10
     let concertStepKey := j.getObjValAs? String    "concert_step_key" |>.toOption
+    let concertId      := j.getObjValAs? String    "concert_id"       |>.toOption
     let inputType      := j.getObjValAs? ResultType "input_type"      |>.toOption |>.getD .unit
     let outputType     := j.getObjValAs? ResultType "output_type"     |>.toOption |>.getD .unit
     let inputJson      := j.getObjVal?   "input_json"  |>.toOption
@@ -146,7 +196,7 @@ instance : FromJson QueueEntry where
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
-             concertStepKey, inputType, outputType, inputJson, outputJson }
+             concertStepKey, concertId, inputType, outputType, inputJson, outputJson }
 
 -- Directories and paths
 
@@ -280,5 +330,47 @@ def cancelStaleConcertEntries : IO Unit := do
   for entry in all do
     if entry.status == .unfinished && entry.concertStepKey.isSome then
       saveEntry { entry with status := .cancelled }
+
+-- Concert run persistence
+
+def concertsDir : IO System.FilePath := do
+  match ← IO.getEnv "HOME" with
+  | some h => return System.FilePath.mk h / ".agent" / "concerts"
+  | none   => throw (.userError "HOME not set")
+
+def saveConcertRun (run : ConcertRun) : IO Unit := do
+  let dir ← concertsDir
+  IO.FS.createDirAll dir
+  IO.FS.writeFile (dir / s!"{run.id}.json") (Lean.Json.compress (ToJson.toJson run))
+
+def loadConcertRun (id : String) : IO (Option ConcertRun) := do
+  let path := (← concertsDir) / s!"{id}.json"
+  if !(← path.pathExists) then return none
+  let contents ← IO.FS.readFile path
+  match Json.parse contents with
+  | .error _ => return none
+  | .ok j    =>
+    match FromJson.fromJson? j with
+    | .error _ => return none
+    | .ok r    => return some r
+
+/-- Load all concert runs, sorted by ID descending (newest first). -/
+def loadAllConcertRuns : IO (Array ConcertRun) := do
+  let dir ← concertsDir
+  if !(← dir.pathExists) then return #[]
+  let entries ← System.FilePath.readDir dir
+  let mut result : Array ConcertRun := #[]
+  for entry in entries do
+    if let some id := stripJsonExt entry.fileName then
+      if let some r ← loadConcertRun id then
+        result := result.push r
+  return result.qsort (fun a b => a.id > b.id)
+
+/-- On daemon startup, mark any running concert runs as cancelled (the fibers died). -/
+def cancelStaleRunningConcerts : IO Unit := do
+  let all ← loadAllConcertRuns
+  for run in all do
+    if run.status == .running then
+      saveConcertRun { run with status := .cancelled }
 
 end Orchestra.Queue

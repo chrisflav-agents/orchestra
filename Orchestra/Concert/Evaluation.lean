@@ -38,17 +38,17 @@ end
 
 mutual
   private partial def evalQueuedWhile (mgr : ConcertManager) (appConfig : Orchestra.AppConfig)
-      (debug : Bool) (cancelToken : Option Std.CancellationToken)
+      (debug : Bool) (cancelToken : Option Std.CancellationToken) (concertId : Option String)
       (cond : Concert Bool) (body : Concert Unit) : IO Unit := do
-    if ← evalQueued mgr appConfig debug cancelToken cond then
-      evalQueued mgr appConfig debug cancelToken body
-      evalQueuedWhile mgr appConfig debug cancelToken cond body
+    if ← evalQueued mgr appConfig debug cancelToken concertId cond then
+      evalQueued mgr appConfig debug cancelToken concertId body
+      evalQueuedWhile mgr appConfig debug cancelToken concertId cond body
 
   /-- Evaluate a Concert program via the queue daemon: each task is submitted as a
       `QueueEntry` and the fiber suspends until the daemon signals completion. -/
   partial def evalQueued (mgr : ConcertManager) (appConfig : Orchestra.AppConfig)
       (debug : Bool := false) (cancelToken : Option Std.CancellationToken := none)
-      : Concert α → IO α
+      (concertId : Option String := none) : Concert α → IO α
     | .pure a  => pure a
     | .abort   => throw (IO.userError "Concert aborted")
     | .op (.run o t input) k => do
@@ -76,6 +76,7 @@ mutual
           readOnly      := spec.readOnly
           priority      := spec.priority
           concertStepKey := some stepKey
+          concertId
           inputType     := ResultType.unit
           outputType    := o
           inputJson     := none
@@ -87,10 +88,10 @@ mutual
           match resultJson.bind (ResultType.valueFromJson o · |>.toOption) with
           | some v => v
           | none   => default
-        evalQueued mgr appConfig debug cancelToken (k result)
+        evalQueued mgr appConfig debug cancelToken concertId (k result)
     | .op (.while cond body) k => do
-        evalQueuedWhile mgr appConfig debug cancelToken cond body
-        evalQueued mgr appConfig debug cancelToken (k ())
+        evalQueuedWhile mgr appConfig debug cancelToken concertId cond body
+        evalQueued mgr appConfig debug cancelToken concertId (k ())
 end
 
 def evalWithConfig (c : Concert α) : IO α := do
