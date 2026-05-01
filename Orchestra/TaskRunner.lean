@@ -1,9 +1,9 @@
+import Orchestra.Config
 import Orchestra.AgentDef
 import Orchestra.Agents.Claude
 import Orchestra.Agents.Opencode
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
-import Orchestra.Config
 import Orchestra.GitHub
 import Orchestra.Repo
 import Orchestra.RepoConfig
@@ -108,24 +108,25 @@ private def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
       let vars := agentDef.envVarsOfAuthSource src
       return vars.map fun (k, v) => (k, some v)
 
-/-- Run a single task: clone repo, start MCP server, run validation loop.
-    Returns the task ID and whether the run was cut short by a usage limit. -/
-def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
+/-- Run a single IOTask: clone repo, start MCP server, run validation loop.
+    Returns the task ID, whether the run was cut short by a usage limit, and the typed output. -/
+def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
+    (idx : Nat) (debug : Bool) (input : i.Type)
     (continuesFrom : Option String := none)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
-    (interactive : Bool := true) : IO (String × Bool) := do
-  IO.println s!"=== Task {idx}: {task.fork} ({repr task.mode}) ==="
+    (interactive : Bool := true) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
+  IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   let taskId ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
   let initialRecord : TaskStore.TaskRecord := {
     id := taskId, createdAt
-    upstream := task.upstream, fork := task.fork, mode := task.mode, prompt := task.prompt
-    continuesFrom, series
-    backend := task.backend, model := task.model, agent := task.agent
-    systemPrompt := task.systemPrompt, budget := task.budget
-    priority := task.priority
+    upstream := ioTask.upstream, fork := ioTask.fork, mode := ioTask.mode
+    prompt := ioTask.prompt, continuesFrom, series
+    backend := ioTask.backend, model := ioTask.model, agent := ioTask.agent
+    systemPrompt := ioTask.systemPrompt, budget := ioTask.budget
+    priority := ioTask.priority
   }
   TaskStore.saveTask initialRecord
   -- Resolve initial resume session from the continued task
@@ -140,7 +141,7 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
   -- 1. Create GitHub App token
   IO.println "  Creating GitHub App token..."
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let (forkOwner, _) ← Repo.splitRepo task.fork
+  let (forkOwner, _) ← Repo.splitRepo ioTask.fork
   let installationId ← match appConfig.installationId with
     | some id => pure id
     | none => GitHub.getInstallationId jwt forkOwner
@@ -148,23 +149,29 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
   GitHub.setupGhAuth token
   IO.println "  Token ready"
   -- 2. Clone / update repo
-  IO.println s!"Cloning/updating {task.fork}..."
-  let repoPath ← Repo.ensureCloned task.fork task.upstream interactive
+  IO.println s!"Cloning/updating {ioTask.fork}..."
+  let repoPath ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive
   IO.println s!"  Repo at {repoPath}"
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
-  let (allowedTools, usingModeFallback) := resolveTools task.mode task.tools
+  let (allowedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
   if usingModeFallback then
     IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
       Use 'tools' instead (e.g. {repr allowedTools}) and optionally 'read_only: true/false'."
+  let inputJson := some (ResultType.valueToJson i input)
+  let outputRef ← IO.mkRef (none : Option Lean.Json)
   let serverState : Server.State := {
-    upstream := task.upstream
-    fork := task.fork
+    upstream := ioTask.upstream
+    fork := ioTask.fork
     allowedTools
     appId := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
     installationId
     pat := appConfig.pat
+    inputType := i
+    outputType := o
+    inputJson
+    outputRef := some outputRef
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"
@@ -172,9 +179,9 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
   RepoConfig.runInitIfNeeded repoPath
   let repoConfig ← RepoConfig.loadRepoConfig repoPath
   -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
-  let baseSystemPrompt ← loadSystemPrompt task.systemPrompt
+  let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
   -- 5a. Resolve memory directories and amend system prompt
-  let memoryDirs ← resolveMemoryDirs task.memory task.upstream
+  let memoryDirs ← resolveMemoryDirs ioTask.memory ioTask.upstream
   let systemPrompt :=
     match baseSystemPrompt, memorySystemPrompt memoryDirs with
     | none,    none    => none
@@ -182,11 +189,11 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     | none,    some mp => some mp
     | some sp, some mp => some (sp ++ "\n\n" ++ mp)
   -- 5b. Load prepend prompt and apply to task prompt
-  let prependPrompt ← loadPrependPrompt task.prependPrompt
+  let prependPrompt ← loadPrependPrompt ioTask.prependPrompt
   let baseTaskPrompt :=
     match prependPrompt with
-    | none    => task.prompt
-    | some pp => pp ++ "\n\n" ++ task.prompt
+    | none    => ioTask.prompt
+    | some pp => pp ++ "\n\n" ++ ioTask.prompt
   let mut sessionId : Option String := none
   let mut usageLimitHit := false
   let mut wasCancelled := false
@@ -200,13 +207,13 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
       else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
     let resume := if attempt == 0 then initialResume else sessionId
     IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
-    let agentDef := match task.backend with
+    let agentDef := match ioTask.backend with
       | some "pi"       => AgentDef.pi
       | some "vibe"     => AgentDef.vibe
       | some "opencode" => AgentDef.opencode
-      | _               => AgentDef.claude
-    let backendName := task.backend.getD "claude"
-    let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName task.authSource
+      | _           => AgentDef.claude
+    let backendName := ioTask.backend.getD "claude"
+    let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName ioTask.authSource
     let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
       |>.map (·.extraPorts) |>.getD #[]
     let debugLogFile : Option System.FilePath ←
@@ -220,13 +227,13 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
       | none => pure none
       | some home =>
         let suffix := if attempt == 0 then "" else s!".retry{attempt}"
-        pure (some (System.FilePath.mk home / ".agent" / "logs" / task.fork / s!"{taskId}{suffix}.log"))
+        pure (some (System.FilePath.mk home / ".agent" / "logs" / ioTask.fork / s!"{taskId}{suffix}.log"))
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
       (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
-      (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
-      (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
+      (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)
+      (resume := resume) (budget := ioTask.budget.getD 4.0) (cancelToken := cancelToken)
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
-      (readOnly := task.readOnly) (extraPorts := extraPorts)
+      (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     lastResultSubtype := result.resultSubtype
@@ -268,6 +275,28 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
   if let some seriesName := series then
     TaskStore.updateSeriesPointer seriesName taskId
   IO.println s!"=== Task {idx} done ===\n"
-  return (taskId, usageLimitHit)
+  let outputJson ← outputRef.get
+  let typedOutput : Option o.Type ← do
+    match outputJson with
+    | none => pure none
+    | some j =>
+      match ResultType.valueFromJson o j with
+      | .ok v    => pure (some v)
+      | .error e =>
+        IO.eprintln s!"  Warning: failed to parse task output: {e}"
+        pure none
+  return ((taskId, usageLimitHit), typedOutput, outputJson)
+
+/-- Run a single task: clone repo, start MCP server, run validation loop.
+    Returns the task ID, whether the run was cut short by a usage limit, and the raw output JSON. -/
+def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
+    (continuesFrom : Option String := none)
+    (series : Option String := none)
+    (cancelToken : Option Std.CancellationToken := none)
+    (interactive : Bool := true) : IO (String × Bool × Option Lean.Json) := do
+  let ((taskId, usageLimitHit), _, outputJson) ←
+    runIOTask appConfig task.ioTask idx debug default
+      continuesFrom series cancelToken interactive
+  return (taskId, usageLimitHit, outputJson)
 
 end Orchestra.TaskRunner
