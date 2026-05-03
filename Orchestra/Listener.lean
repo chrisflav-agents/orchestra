@@ -320,12 +320,6 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
   -- and github-comments sources).
   let issueNumber : Option Nat :=
     vars.find? (fun p => p.1 == "issue_number") |>.map (·.2) |>.bind (·.toNat?)
-  -- For inline PR review comments the comment_id is prefixed with "inline:"; extract
-  -- the numeric ID so the `comment` tool can reply to the specific thread.
-  let replyToCommentId : Option Nat :=
-    vars.find? (fun p => p.1 == "comment_id") |>.map (·.2)
-    |>.bind (fun s =>
-      if s.startsWith "inline:" then (s.drop "inline:".length).toNat? else none)
   IO.eprintln s!"[listener] buildQueueEntry: model={repr action.model} budget={repr action.budget} agent={repr action.agent} priority={action.priority}"
   return {
     id, createdAt, status := .pending,
@@ -345,7 +339,6 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     readOnly     := action.readOnly
     priority     := action.priority
     issueNumber
-    replyToCommentId
   }
 
 -- GitHub helpers
@@ -534,7 +527,11 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           let parentUrlField := if inline then "pull_request_url" else "issue_url"
           let parentUrl      := comment.getObjValAs? String parentUrlField |>.toOption |>.getD ""
           let issueNum       := parentUrl.splitOn "/" |>.getLast? |>.getD ""
-          let vars := [("comment_id", idStr), ("body", body), ("author", author),
+          -- For inline comments, also expose the numeric ID as `inline_comment_id` so prompt
+          -- templates can pass it directly to the `comment` tool's `reply_to_comment_id` argument.
+          let inlineCommentId := if inline then toString idNum else ""
+          let vars := [("comment_id", idStr), ("inline_comment_id", inlineCommentId),
+                       ("body", body), ("author", author),
                        ("url", url), ("issue_number", issueNum),
                        ("upstream", entry.upstream), ("fork", entry.fork),
                        ("upstream_escaped", entry.upstream.replace "/" "_"),

@@ -32,9 +32,6 @@ structure State where
   outputRef : Option (IO.Ref (Option Json)) := none
   /-- Issue or PR number this task was launched from. Required for the `comment` tool. -/
   issueNumber : Option Nat := none
-  /-- ID of the inline PR review comment to reply to (when triggered by an inline comment).
-      When set, the `comment` tool replies to that inline thread instead of posting a top-level comment. -/
-  replyToCommentId : Option Nat := none
   /-- Email address for the `report` tool. -/
   email : Option String := none
 
@@ -123,13 +120,44 @@ private def optionalToolDefs : List (String × Json) := [
   ]),
   ("comment", Json.mkObj [
     ("name", "comment"),
-    ("description", "Post a comment on the issue or pull request this task was launched from."),
+    ("description",
+      "Post a comment on the issue or pull request this task was launched from.\n\n" ++
+      "Three modes determined by the arguments provided:\n" ++
+      "• Regular comment: provide only `body`.\n" ++
+      "• Reply to an existing inline PR review comment: provide `body` and `reply_to_comment_id`.\n" ++
+      "• New inline PR review comment on a specific file and line: provide `body`, `path`, and `line`.\n\n" ++
+      "`reply_to_comment_id` and `path`/`line` are mutually exclusive."),
     ("inputSchema", Json.mkObj [
       ("type", "object"),
       ("properties", Json.mkObj [
         ("body", Json.mkObj [
           ("type", "string"),
           ("description", "The comment text.")
+        ]),
+        ("reply_to_comment_id", Json.mkObj [
+          ("type", "integer"),
+          ("description",
+            "ID of the inline PR review comment to reply to. " ++
+            "Mutually exclusive with path and line.")
+        ]),
+        ("path", Json.mkObj [
+          ("type", "string"),
+          ("description",
+            "File path for a new inline review comment. " ++
+            "Required together with line. Mutually exclusive with reply_to_comment_id.")
+        ]),
+        ("line", Json.mkObj [
+          ("type", "integer"),
+          ("description",
+            "Line number for a new inline review comment. " ++
+            "Required together with path. Mutually exclusive with reply_to_comment_id.")
+        ]),
+        ("side", Json.mkObj [
+          ("type", "string"),
+          ("description",
+            "Which side of the diff to comment on when creating a new inline review comment " ++
+            "(default: RIGHT)."),
+          ("enum", .arr #["LEFT", "RIGHT"])
         ])
       ]),
       ("required", .arr #["body"])
@@ -191,13 +219,22 @@ private def toolsList (state : State) : Json :=
 
 -- Types
 
+/-- The action performed by the `comment` tool. -/
+inductive CommentAction where
+  /-- Post a top-level comment on the issue or PR. -/
+  | issue
+  /-- Reply to an existing inline PR review comment. -/
+  | replyInline (commentId : Nat)
+  /-- Create a new inline PR review comment on a specific file and line. -/
+  | newInline (path : String) (line : Nat) (side : String)
+
 /-- A parsed and validated tool call. `parseError` carries an argument validation failure. -/
 inductive ToolCall where
   | health
   | refreshToken
   | createPr (title : String) (body : String) (head : String) (base : String)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
-  | comment (body : String)
+  | comment (body : String) (action : CommentAction)
   | report (subject : String) (body : String)
   | getTaskInput
   | submitTaskOutput (value : Json)
@@ -240,7 +277,21 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
   | "comment" =>
     match args.getObjValAs? String "body" |>.toOption with
     | none => .parseError "missing required 'body' argument"
-    | some body => if body.isEmpty then .parseError "'body' must not be empty" else .comment body
+    | some body =>
+      if body.isEmpty then .parseError "'body' must not be empty"
+      else
+        let replyToId := args.getObjValAs? Nat "reply_to_comment_id" |>.toOption
+        let path      := args.getObjValAs? String "path"             |>.toOption
+        let line      := args.getObjValAs? Nat "line"                |>.toOption
+        let side      := args.getObjValAs? String "side"             |>.toOption |>.getD "RIGHT"
+        match replyToId, path, line with
+        | some cid, none, none => .comment body (.replyInline cid)
+        | none, some p, some l => .comment body (.newInline p l side)
+        | none, none, none     => .comment body .issue
+        | some _, _, _         =>
+          .parseError "'reply_to_comment_id' and 'path'/'line' are mutually exclusive"
+        | none, some _, none   => .parseError "'path' requires 'line'"
+        | none, none, some _   => .parseError "'line' requires 'path'"
   | "report" =>
     let subject := args.getObjValAs? String "subject" |>.toOption |>.getD ""
     let body    := args.getObjValAs? String "body"    |>.toOption |>.getD ""
@@ -363,7 +414,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     catch e =>
       log s!"tool get_pr_comments: error: {e}"
       return toolContent (toString e) (isError := true)
-  | .comment body =>
+  | .comment body action =>
     if !state.allowedTools.contains "comment" then
       log "tool comment: denied (not in allowed tools)"
       return toolContent "comment tool is not enabled for this task" (isError := true)
@@ -372,21 +423,30 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       log "tool comment: no issue number configured"
       return toolContent "no issue_number configured for this task" (isError := true)
     | some n =>
-      match state.replyToCommentId with
-      | some cid =>
-        log s!"tool comment: replying to inline comment {cid} on {state.upstream}#{n}"
+      match action with
+      | .issue =>
+        log s!"tool comment: posting to {state.upstream}#{n}"
         try
-          let result ← GitHub.replyToPrReviewComment state.pat state.upstream cid body
-          log s!"tool comment: ok"
+          let result ← GitHub.createIssueComment state.pat state.upstream n body
+          log "tool comment: ok"
           return toolContent result
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
-      | none =>
-        log s!"tool comment: posting to {state.upstream}#{n}"
+      | .replyInline cid =>
+        log s!"tool comment: replying to inline comment {cid} on {state.upstream}#{n}"
         try
-          let result ← GitHub.createIssueComment state.pat state.upstream n body
-          log s!"tool comment: ok"
+          let result ← GitHub.replyToPrReviewComment state.pat state.upstream cid body
+          log "tool comment: ok"
+          return toolContent result
+        catch e =>
+          log s!"tool comment: error: {e}"
+          return toolContent (toString e) (isError := true)
+      | .newInline path line side =>
+        log s!"tool comment: new inline comment on {state.upstream}#{n} {path}:{line} ({side})"
+        try
+          let result ← GitHub.createPrReviewComment state.pat state.upstream n body path line side
+          log "tool comment: ok"
           return toolContent result
         catch e =>
           log s!"tool comment: error: {e}"

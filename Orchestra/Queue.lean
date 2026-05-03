@@ -129,9 +129,7 @@ structure QueueEntry where
   /-- Serialized task output, written by the daemon after the task completes. -/
   outputJson    : Option Json    := none
   /-- Issue or PR number this task was launched from. Enables the `comment` tool. -/
-  issueNumber      : Option Nat := none
-  /-- ID of the inline PR review comment to reply to (when triggered by an inline comment). -/
-  replyToCommentId : Option Nat := none
+  issueNumber : Option Nat := none
 
 instance : ToJson QueueEntry where
   toJson e :=
@@ -165,8 +163,7 @@ instance : ToJson QueueEntry where
     let fields := if e.outputType != .unit          then fields ++ [("output_type",      ToJson.toJson e.outputType)]  else fields
     let fields := if let some j := e.inputJson       then fields ++ [("input_json",          j)]                           else fields
     let fields := if let some j := e.outputJson      then fields ++ [("output_json",         j)]                           else fields
-    let fields := if let some n := e.issueNumber     then fields ++ [("issue_number",         Json.num n)]                  else fields
-    let fields := if let some n := e.replyToCommentId then fields ++ [("reply_to_comment_id", Json.num n)]                  else fields
+    let fields := if let some n := e.issueNumber then fields ++ [("issue_number", Json.num n)] else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -199,13 +196,12 @@ instance : FromJson QueueEntry where
     let outputType     := j.getObjValAs? ResultType "output_type"     |>.toOption |>.getD .unit
     let inputJson        := j.getObjVal?   "input_json"          |>.toOption
     let outputJson       := j.getObjVal?   "output_json"         |>.toOption
-    let issueNumber      := j.getObjValAs? Nat "issue_number"        |>.toOption
-    let replyToCommentId := j.getObjValAs? Nat "reply_to_comment_id" |>.toOption
+    let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
-             issueNumber, replyToCommentId }
+             issueNumber }
 
 -- Directories and paths
 

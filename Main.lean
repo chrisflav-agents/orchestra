@@ -584,8 +584,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         tools            := entry.tools
         readOnly         := entry.readOnly
         priority         := entry.priority
-        issueNumber      := entry.issueNumber
-        replyToCommentId := entry.replyToCommentId
+        issueNumber := entry.issueNumber
       }
     }
     let cfg ← match entry.configPath with

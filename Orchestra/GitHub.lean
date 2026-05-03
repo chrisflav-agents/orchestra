@@ -149,6 +149,36 @@ def replyToPrReviewComment (pat : String) (upstream : String) (commentId : Nat) 
     "-f", s!"body={body}"
   ] (env := env)
 
+/-- Get the latest commit SHA of a pull request. -/
+private def getPrLatestCommit (pat : String) (upstream : String) (prNumber : Nat) : IO String := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  runCmd "gh" #[
+    "api",
+    s!"/repos/{owner}/{repo}/pulls/{prNumber}",
+    "--jq", ".head.sha"
+  ] (env := env)
+
+/-- Create a new inline PR review comment on a specific file and line. -/
+def createPrReviewComment (pat : String) (upstream : String) (prNumber : Nat)
+    (body path : String) (line : Nat) (side : String) : IO String := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let commitId ← getPrLatestCommit pat upstream prNumber
+  runCmd "gh" #[
+    "api", "--method", "POST",
+    s!"/repos/{owner}/{repo}/pulls/{prNumber}/comments",
+    "-f", s!"body={body}",
+    "-f", s!"path={path}",
+    "-f", s!"side={side}",
+    "-f", s!"commit_id={commitId}",
+    "-F", s!"line={line}"
+  ] (env := env)
+
 /-- Send a report email via the `sendmail` command. -/
 def sendEmail (to : String) (subject : String) (body : String) : IO Unit := do
   let message := s!"To: {to}\nSubject: {subject}\n\n{body}"
