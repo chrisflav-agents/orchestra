@@ -140,6 +140,10 @@ structure ActionConfig where
       single task. Template variables are applied to the workflow's upstream/fork
       before conversion. -/
   workflowPath   : Option String := none
+  /-- Issue/PR number to associate with the task. May be a template string
+      (e.g. `"{{pr_number}}"`) or a literal (e.g. `"69"`). When absent the
+      `issue_number` template variable provided by the event source is used. -/
+  issueNumber    : Option String := none
 
 instance : ToJson ActionConfig where
   toJson a :=
@@ -162,6 +166,7 @@ instance : ToJson ActionConfig where
     let fields := if a.readOnly                   then fields ++ [("read_only",      Json.bool true)]  else fields
     let fields := if a.priority != 10             then fields ++ [("priority",        Json.num a.priority)] else fields
     let fields := if let some p := a.workflowPath then fields ++ [("workflow_path",  Json.str p)]          else fields
+    let fields := if let some n := a.issueNumber  then fields ++ [("issue_number",   Json.str n)]          else fields
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -190,8 +195,9 @@ instance : FromJson ActionConfig where
     let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let priority     := j.getObjValAs? Nat    "priority"      |>.toOption |>.getD 10
     let workflowPath := j.getObjValAs? String "workflow_path" |>.toOption
+    let issueNumber  := j.getObjValAs? String "issue_number"  |>.toOption
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, authSource, tools, readOnly, priority, workflowPath }
+             budget, memory, authSource, tools, readOnly, priority, workflowPath, issueNumber }
 
 -- Listener config
 
@@ -316,10 +322,12 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
   let fork :=
     let rendered := renderTemplate action.fork vars
     if rendered.isEmpty then lookupVar "fork" else rendered
-  -- Extract issue_number from template vars (set by github-issues, github-pr-reviews,
-  -- and github-comments sources).
+  -- Resolve issue_number: prefer the explicit template field from the action config;
+  -- fall back to the `issue_number` variable supplied by the event source.
   let issueNumber : Option Nat :=
-    vars.find? (fun p => p.1 == "issue_number") |>.map (·.2) |>.bind (·.toNat?)
+    match action.issueNumber with
+    | some tmpl => (renderTemplate tmpl vars).toNat?
+    | none      => vars.find? (fun p => p.1 == "issue_number") |>.map (·.2) |>.bind (·.toNat?)
   IO.eprintln s!"[listener] buildQueueEntry: model={repr action.model} budget={repr action.budget} agent={repr action.agent} priority={action.priority}"
   return {
     id, createdAt, status := .pending,

@@ -122,11 +122,12 @@ private def optionalToolDefs : List (String × Json) := [
     ("name", "comment"),
     ("description",
       "Post a comment on the issue or pull request this task was launched from.\n\n" ++
-      "Three modes determined by the arguments provided:\n" ++
+      "Four modes determined by the arguments provided:\n" ++
       "• Regular comment: provide only `body`.\n" ++
+      "• Pull-request review (single review body, no approval/rejection): provide `body` and set `review` to true.\n" ++
       "• Reply to an existing inline PR review comment: provide `body` and `reply_to_comment_id`.\n" ++
       "• New inline PR review comment on a specific file and line: provide `body`, `path`, and `line`.\n\n" ++
-      "`reply_to_comment_id` and `path`/`line` are mutually exclusive."),
+      "`review`, `reply_to_comment_id`, and `path`/`line` are mutually exclusive."),
     ("inputSchema", Json.mkObj [
       ("type", "object"),
       ("properties", Json.mkObj [
@@ -134,23 +135,29 @@ private def optionalToolDefs : List (String × Json) := [
           ("type", "string"),
           ("description", "The comment text.")
         ]),
+        ("review", Json.mkObj [
+          ("type", "boolean"),
+          ("description",
+            "When true, post body as a pull-request review (COMMENT event) rather than a plain comment. " ++
+            "Mutually exclusive with reply_to_comment_id and path/line.")
+        ]),
         ("reply_to_comment_id", Json.mkObj [
           ("type", "integer"),
           ("description",
             "ID of the inline PR review comment to reply to. " ++
-            "Mutually exclusive with path and line.")
+            "Mutually exclusive with review, path and line.")
         ]),
         ("path", Json.mkObj [
           ("type", "string"),
           ("description",
             "File path for a new inline review comment. " ++
-            "Required together with line. Mutually exclusive with reply_to_comment_id.")
+            "Required together with line. Mutually exclusive with review and reply_to_comment_id.")
         ]),
         ("line", Json.mkObj [
           ("type", "integer"),
           ("description",
             "Line number for a new inline review comment. " ++
-            "Required together with path. Mutually exclusive with reply_to_comment_id.")
+            "Required together with path. Mutually exclusive with review and reply_to_comment_id.")
         ]),
         ("side", Json.mkObj [
           ("type", "string"),
@@ -223,6 +230,8 @@ private def toolsList (state : State) : Json :=
 inductive CommentAction where
   /-- Post a top-level comment on the issue or PR. -/
   | issue
+  /-- Post a pull-request review body (COMMENT event, no approval/rejection). -/
+  | review
   /-- Reply to an existing inline PR review comment. -/
   | replyInline (commentId : Nat)
   /-- Create a new inline PR review comment on a specific file and line. -/
@@ -280,18 +289,25 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
     | some body =>
       if body.isEmpty then .parseError "'body' must not be empty"
       else
+        let review    := args.getObjValAs? Bool "review"              |>.toOption |>.getD false
         let replyToId := args.getObjValAs? Nat "reply_to_comment_id" |>.toOption
         let path      := args.getObjValAs? String "path"             |>.toOption
         let line      := args.getObjValAs? Nat "line"                |>.toOption
         let side      := args.getObjValAs? String "side"             |>.toOption |>.getD "RIGHT"
-        match replyToId, path, line with
-        | some cid, none, none => .comment body (.replyInline cid)
-        | none, some p, some l => .comment body (.newInline p l side)
-        | none, none, none     => .comment body .issue
-        | some _, _, _         =>
-          .parseError "'reply_to_comment_id' and 'path'/'line' are mutually exclusive"
-        | none, some _, none   => .parseError "'path' requires 'line'"
-        | none, none, some _   => .parseError "'line' requires 'path'"
+        if review then
+          match replyToId, path, line with
+          | none, none, none => .comment body .review
+          | _, _, _          =>
+            .parseError "'review' is mutually exclusive with 'reply_to_comment_id' and 'path'/'line'"
+        else
+          match replyToId, path, line with
+          | some cid, none, none => .comment body (.replyInline cid)
+          | none, some p, some l => .comment body (.newInline p l side)
+          | none, none, none     => .comment body .issue
+          | some _, _, _         =>
+            .parseError "'reply_to_comment_id' and 'path'/'line' are mutually exclusive"
+          | none, some _, none   => .parseError "'path' requires 'line'"
+          | none, none, some _   => .parseError "'line' requires 'path'"
   | "report" =>
     let subject := args.getObjValAs? String "subject" |>.toOption |>.getD ""
     let body    := args.getObjValAs? String "body"    |>.toOption |>.getD ""
@@ -428,6 +444,15 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
         log s!"tool comment: posting to {state.upstream}#{n}"
         try
           let result ← GitHub.createIssueComment state.pat state.upstream n body
+          log "tool comment: ok"
+          return toolContent result
+        catch e =>
+          log s!"tool comment: error: {e}"
+          return toolContent (toString e) (isError := true)
+      | .review =>
+        log s!"tool comment: posting review to {state.upstream}#{n}"
+        try
+          let result ← GitHub.createPrReview state.pat state.upstream n body
           log "tool comment: ok"
           return toolContent result
         catch e =>

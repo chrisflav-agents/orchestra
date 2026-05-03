@@ -179,6 +179,19 @@ def createPrReviewComment (pat : String) (upstream : String) (prNumber : Nat)
     "-F", s!"line={line}"
   ] (env := env)
 
+/-- Post a review (body only, no approval/rejection) on a pull request. -/
+def createPrReview (pat : String) (upstream : String) (prNumber : Nat) (body : String) : IO String := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  runCmd "gh" #[
+    "api", "--method", "POST",
+    s!"/repos/{owner}/{repo}/pulls/{prNumber}/reviews",
+    "-f", s!"body={body}",
+    "-f", "event=COMMENT"
+  ] (env := env)
+
 /-- Send a report email via the `sendmail` command. -/
 def sendEmail (to : String) (subject : String) (body : String) : IO Unit := do
   let message := s!"To: {to}\nSubject: {subject}\n\n{body}"
