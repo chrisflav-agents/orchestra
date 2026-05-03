@@ -4,6 +4,13 @@ open Lean (Json FromJson ToJson)
 
 namespace Orchestra.GitHub
 
+/-- An inline review comment to include in a PR review. -/
+structure InlineComment where
+  path : String
+  line : Nat
+  body : String
+  side : String
+
 private def runCmd (cmd : String) (args : Array String)
     (input : Option String := none)
     (env : Array (String × Option String) := #[]) : IO String := do
@@ -179,18 +186,30 @@ def createPrReviewComment (pat : String) (upstream : String) (prNumber : Nat)
     "-F", s!"line={line}"
   ] (env := env)
 
-/-- Post a review (body only, no approval/rejection) on a pull request. -/
-def createPrReview (pat : String) (upstream : String) (prNumber : Nat) (body : String) : IO String := do
+/-- Post a review (with optional inline comments) on a pull request. -/
+def createPrReview (pat : String) (upstream : String) (prNumber : Nat)
+    (body : String) (comments : Array InlineComment := #[]) : IO String := do
   let parts := upstream.splitOn "/"
   let owner := parts[0]?.getD ""
   let repo  := parts[1]?.getD ""
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let commentsJson := comments.map fun c =>
+    Json.mkObj [
+      ("path", c.path),
+      ("line", Json.num ⟨(c.line : Int), 0⟩),
+      ("body", c.body),
+      ("side", c.side)
+    ]
+  let payload := Json.mkObj [
+    ("body", body),
+    ("event", "COMMENT"),
+    ("comments", .arr commentsJson)
+  ]
   runCmd "gh" #[
     "api", "--method", "POST",
     s!"/repos/{owner}/{repo}/pulls/{prNumber}/reviews",
-    "-f", s!"body={body}",
-    "-f", "event=COMMENT"
-  ] (env := env)
+    "--input", "-"
+  ] (input := payload.compress) (env := env)
 
 /-- Send a report email via the `sendmail` command. -/
 def sendEmail (to : String) (subject : String) (body : String) : IO Unit := do
