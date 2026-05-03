@@ -206,6 +206,9 @@ structure IOTask (i o : ResultType) where
   /-- Issue or PR number this task was launched from.
       When set, enables the `comment` tool to post to that issue/PR. -/
   issueNumber : Option Nat := none
+  /-- ID of the inline PR review comment to reply to (when triggered by an inline comment).
+      When set, the `comment` tool replies to that inline thread instead of posting a top-level comment. -/
+  replyToCommentId : Option Nat := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -301,9 +304,11 @@ instance : FromJson Task where
     let readOnly   := j.getObjValAs? Bool "read_only"        |>.toOption |>.getD false
     let series      := j.getObjValAs? String "series"          |>.toOption
     let priority    := j.getObjValAs? Nat "priority"           |>.toOption |>.getD 10
-    let issueNumber := j.getObjValAs? Nat "issue_number"       |>.toOption
+    let issueNumber      := j.getObjValAs? Nat "issue_number"        |>.toOption
+    let replyToCommentId := j.getObjValAs? Nat "reply_to_comment_id" |>.toOption
     return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, prependPrompt, backend, model,
-                                budget, memory, authSource, tools, readOnly, series, priority, issueNumber } }
+                                budget, memory, authSource, tools, readOnly, series, priority,
+                                issueNumber, replyToCommentId } }
 
 structure AppConfig where
   appId : Nat

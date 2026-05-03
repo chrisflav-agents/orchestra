@@ -316,6 +316,16 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
   let fork :=
     let rendered := renderTemplate action.fork vars
     if rendered.isEmpty then lookupVar "fork" else rendered
+  -- Extract issue_number from template vars (set by github-issues, github-pr-reviews,
+  -- and github-comments sources).
+  let issueNumber : Option Nat :=
+    vars.find? (fun p => p.1 == "issue_number") |>.map (·.2) |>.bind (·.toNat?)
+  -- For inline PR review comments the comment_id is prefixed with "inline:"; extract
+  -- the numeric ID so the `comment` tool can reply to the specific thread.
+  let replyToCommentId : Option Nat :=
+    vars.find? (fun p => p.1 == "comment_id") |>.map (·.2)
+    |>.bind (fun s =>
+      if s.startsWith "inline:" then (s.drop "inline:".length).toNat? else none)
   IO.eprintln s!"[listener] buildQueueEntry: model={repr action.model} budget={repr action.budget} agent={repr action.agent} priority={action.priority}"
   return {
     id, createdAt, status := .pending,
@@ -334,6 +344,8 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     tools        := action.tools
     readOnly     := action.readOnly
     priority     := action.priority
+    issueNumber
+    replyToCommentId
   }
 
 -- GitHub helpers

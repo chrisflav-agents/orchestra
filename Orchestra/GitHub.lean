@@ -137,6 +137,18 @@ def createIssueComment (pat : String) (upstream : String) (issueNumber : Nat) (b
     "-f", s!"body={body}"
   ] (env := env)
 
+/-- Reply to an inline PR review comment. -/
+def replyToPrReviewComment (pat : String) (upstream : String) (commentId : Nat) (body : String) : IO String := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  runCmd "gh" #[
+    "api", "--method", "POST",
+    s!"/repos/{owner}/{repo}/pulls/comments/{commentId}/replies",
+    "-f", s!"body={body}"
+  ] (env := env)
+
 /-- Send a report email via the `sendmail` command. -/
 def sendEmail (to : String) (subject : String) (body : String) : IO Unit := do
   let message := s!"To: {to}\nSubject: {subject}\n\n{body}"

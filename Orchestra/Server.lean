@@ -32,6 +32,9 @@ structure State where
   outputRef : Option (IO.Ref (Option Json)) := none
   /-- Issue or PR number this task was launched from. Required for the `comment` tool. -/
   issueNumber : Option Nat := none
+  /-- ID of the inline PR review comment to reply to (when triggered by an inline comment).
+      When set, the `comment` tool replies to that inline thread instead of posting a top-level comment. -/
+  replyToCommentId : Option Nat := none
   /-- Email address for the `report` tool. -/
   email : Option String := none
 
@@ -369,14 +372,25 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       log "tool comment: no issue number configured"
       return toolContent "no issue_number configured for this task" (isError := true)
     | some n =>
-      log s!"tool comment: posting to {state.upstream}#{n}"
-      try
-        let result ← GitHub.createIssueComment state.pat state.upstream n body
-        log s!"tool comment: ok"
-        return toolContent result
-      catch e =>
-        log s!"tool comment: error: {e}"
-        return toolContent (toString e) (isError := true)
+      match state.replyToCommentId with
+      | some cid =>
+        log s!"tool comment: replying to inline comment {cid} on {state.upstream}#{n}"
+        try
+          let result ← GitHub.replyToPrReviewComment state.pat state.upstream cid body
+          log s!"tool comment: ok"
+          return toolContent result
+        catch e =>
+          log s!"tool comment: error: {e}"
+          return toolContent (toString e) (isError := true)
+      | none =>
+        log s!"tool comment: posting to {state.upstream}#{n}"
+        try
+          let result ← GitHub.createIssueComment state.pat state.upstream n body
+          log s!"tool comment: ok"
+          return toolContent result
+        catch e =>
+          log s!"tool comment: error: {e}"
+          return toolContent (toString e) (isError := true)
   | .report subject body =>
     if !state.allowedTools.contains "report" then
       log "tool report: denied (not in allowed tools)"
