@@ -21,8 +21,17 @@ private def runCmd (cmd : String) (args : Array String)
     stderr := .piped
   }
   if let some s := input then
-    child.stdin.putStr s
-    child.stdin.flush
+    -- takeStdin extracts stdin so it can be dropped (closed/EOF) while child is still alive
+    let (stdinHandle, child') ← child.takeStdin
+    stdinHandle.putStr s
+    stdinHandle.flush
+    -- stdinHandle drops here, signaling EOF to the child process
+    let stdout ← child'.stdout.readToEnd
+    let stderr ← child'.stderr.readToEnd
+    let code ← child'.wait
+    if code != 0 then
+      throw (.userError s!"{cmd} failed (exit {code}):\n{stderr}")
+    return stdout.trimAscii.toString
   let stdout ← child.stdout.readToEnd
   let stderr ← child.stderr.readToEnd
   let code ← child.wait
