@@ -30,6 +30,10 @@ structure State where
   inputJson : Option Json := none
   /-- Mutable cell where the agent stores its typed output via `submit_task_output`. -/
   outputRef : Option (IO.Ref (Option Json)) := none
+  /-- Issue or PR number this task was launched from. Required for the `comment` tool. -/
+  issueNumber : Option Nat := none
+  /-- Email address for the `report` tool. -/
+  email : Option String := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -113,6 +117,38 @@ private def optionalToolDefs : List (String × Json) := [
       ]),
       ("required", .arr #["head"])
     ])
+  ]),
+  ("comment", Json.mkObj [
+    ("name", "comment"),
+    ("description", "Post a comment on the issue or pull request this task was launched from."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("body", Json.mkObj [
+          ("type", "string"),
+          ("description", "The comment text.")
+        ])
+      ]),
+      ("required", .arr #["body"])
+    ])
+  ]),
+  ("report", Json.mkObj [
+    ("name", "report"),
+    ("description", "Send a private report via email to the configured address."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("subject", Json.mkObj [
+          ("type", "string"),
+          ("description", "Email subject line.")
+        ]),
+        ("body", Json.mkObj [
+          ("type", "string"),
+          ("description", "Email body text.")
+        ])
+      ]),
+      ("required", .arr #["subject", "body"])
+    ])
   ])
 ]
 
@@ -158,6 +194,8 @@ inductive ToolCall where
   | refreshToken
   | createPr (title : String) (body : String) (head : String) (base : String)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
+  | comment (body : String)
+  | report (subject : String) (body : String)
   | getTaskInput
   | submitTaskOutput (value : Json)
   | unknown (name : String)
@@ -196,6 +234,16 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
           let unresolvedOnly  := args.getObjValAs? Bool "unresolved_only"  |>.toOption |>.getD false
           let excludeOutdated := args.getObjValAs? Bool "exclude_outdated" |>.toOption |>.getD false
           .getPrComments prNumInt.toNat unresolvedOnly excludeOutdated
+  | "comment" =>
+    match args.getObjValAs? String "body" |>.toOption with
+    | none => .parseError "missing required 'body' argument"
+    | some body => if body.isEmpty then .parseError "'body' must not be empty" else .comment body
+  | "report" =>
+    let subject := args.getObjValAs? String "subject" |>.toOption |>.getD ""
+    let body    := args.getObjValAs? String "body"    |>.toOption |>.getD ""
+    if subject.isEmpty then .parseError "missing required 'subject' argument"
+    else if body.isEmpty then .parseError "missing required 'body' argument"
+    else .report subject body
   | "get_task_input" => .getTaskInput
   | "submit_task_output" =>
     match args.getObjVal? "value" with
@@ -312,6 +360,40 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     catch e =>
       log s!"tool get_pr_comments: error: {e}"
       return toolContent (toString e) (isError := true)
+  | .comment body =>
+    if !state.allowedTools.contains "comment" then
+      log "tool comment: denied (not in allowed tools)"
+      return toolContent "comment tool is not enabled for this task" (isError := true)
+    match state.issueNumber with
+    | none =>
+      log "tool comment: no issue number configured"
+      return toolContent "no issue_number configured for this task" (isError := true)
+    | some n =>
+      log s!"tool comment: posting to {state.upstream}#{n}"
+      try
+        let result ← GitHub.createIssueComment state.pat state.upstream n body
+        log s!"tool comment: ok"
+        return toolContent result
+      catch e =>
+        log s!"tool comment: error: {e}"
+        return toolContent (toString e) (isError := true)
+  | .report subject body =>
+    if !state.allowedTools.contains "report" then
+      log "tool report: denied (not in allowed tools)"
+      return toolContent "report tool is not enabled for this task" (isError := true)
+    match state.email with
+    | none =>
+      log "tool report: no email configured"
+      return toolContent "no email address configured (set 'email' in config)" (isError := true)
+    | some addr =>
+      log s!"tool report: sending to {addr}, subject={repr subject}"
+      try
+        GitHub.sendEmail addr subject body
+        log s!"tool report: ok"
+        return toolContent s!"Report sent to {addr}"
+      catch e =>
+        log s!"tool report: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .getTaskInput =>
     log "tool get_task_input"
     match state.inputJson with

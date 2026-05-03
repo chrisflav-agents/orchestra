@@ -172,6 +172,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     outputType := o
     inputJson
     outputRef := some outputRef
+    issueNumber := ioTask.issueNumber
+    email := appConfig.email
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"

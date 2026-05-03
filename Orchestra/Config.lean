@@ -203,6 +203,9 @@ structure IOTask (i o : ResultType) where
   /-- Priority of this task. Natural number; higher = more important.
       Defaults to 10 if not set. -/
   priority : Nat := 10
+  /-- Issue or PR number this task was launched from.
+      When set, enables the `comment` tool to post to that issue/PR. -/
+  issueNumber : Option Nat := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -296,10 +299,11 @@ instance : FromJson Task where
     let authSource := j.getObjValAs? String "auth_source"    |>.toOption
     let tools      := j.getObjValAs? (List String) "tools"   |>.toOption
     let readOnly   := j.getObjValAs? Bool "read_only"        |>.toOption |>.getD false
-    let series     := j.getObjValAs? String "series"         |>.toOption
-    let priority   := j.getObjValAs? Nat "priority"          |>.toOption |>.getD 10
+    let series      := j.getObjValAs? String "series"          |>.toOption
+    let priority    := j.getObjValAs? Nat "priority"           |>.toOption |>.getD 10
+    let issueNumber := j.getObjValAs? Nat "issue_number"       |>.toOption
     return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, prependPrompt, backend, model,
-                                budget, memory, authSource, tools, readOnly, series, priority } }
+                                budget, memory, authSource, tools, readOnly, series, priority, issueNumber } }
 
 structure AppConfig where
   appId : Nat
@@ -322,6 +326,8 @@ structure AppConfig where
   /-- Per-backend authentication source configurations.
       Allows configuring multiple named authentication sources for each agent backend. -/
   agentAuthConfigs : Array AgentAuthConfig := #[]
+  /-- Email address for the `report` tool. When set, agents may send reports to this address. -/
+  email : Option String := none
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -341,9 +347,10 @@ instance : FromJson AppConfig where
     let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
     let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
     let agentAuthConfigs := j.getObjValAs? (Array AgentAuthConfig) "agents" |>.toOption |>.getD #[]
+    let email := j.getObjValAs? String "email" |>.toOption
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
-             agentAuthConfigs }
+             agentAuthConfigs, email }
 
 structure TaskFile where
   tasks : Array Task
