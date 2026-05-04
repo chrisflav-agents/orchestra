@@ -4,6 +4,13 @@ open Lean (Json FromJson ToJson)
 
 namespace Orchestra.GitHub
 
+/-- An inline review comment to include in a PR review. -/
+structure InlineComment where
+  path : String
+  line : Nat
+  body : String
+  side : String
+
 private def runCmd (cmd : String) (args : Array String)
     (input : Option String := none)
     (env : Array (String × Option String) := #[]) : IO String := do
@@ -14,8 +21,17 @@ private def runCmd (cmd : String) (args : Array String)
     stderr := .piped
   }
   if let some s := input then
-    child.stdin.putStr s
-    child.stdin.flush
+    -- takeStdin extracts stdin so it can be dropped (closed/EOF) while child is still alive
+    let (stdinHandle, child') ← child.takeStdin
+    stdinHandle.putStr s
+    stdinHandle.flush
+    -- stdinHandle drops here, signaling EOF to the child process
+    let stdout ← child'.stdout.readToEnd
+    let stderr ← child'.stderr.readToEnd
+    let code ← child'.wait
+    if code != 0 then
+      throw (.userError s!"{cmd} failed (exit {code}):\n{stderr}")
+    return stdout.trimAscii.toString
   let stdout ← child.stdout.readToEnd
   let stderr ← child.stderr.readToEnd
   let code ← child.wait
@@ -124,5 +140,108 @@ def getPrReviewThreads (upstream : String) (prNumber : Nat) (pat : String) : IO 
   match Json.parse result with
   | .error e => throw (.userError s!"failed to parse GraphQL response: {e}")
   | .ok j => return j
+
+/-- Post a comment on an issue or pull request. -/
+def createIssueComment (pat : String) (upstream : String) (issueNumber : Nat) (body : String) : IO String := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let payload := Json.mkObj [("body", body)]
+  runCmd "gh" #[
+    "api", "--method", "POST",
+    s!"/repos/{owner}/{repo}/issues/{issueNumber}/comments",
+    "--input", "-"
+  ] (input := payload.compress) (env := env)
+
+/-- Reply to an inline PR review comment. -/
+def replyToPrReviewComment (pat : String) (upstream : String) (prNumber : Nat) (commentId : Nat) (body : String) : IO String := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let payload := Json.mkObj [("body", body)]
+  runCmd "gh" #[
+    "api", "--method", "POST",
+    s!"/repos/{owner}/{repo}/pulls/{prNumber}/comments/{commentId}/replies",
+    "--input", "-"
+  ] (input := payload.compress) (env := env)
+
+/-- Get the latest commit SHA of a pull request. -/
+private def getPrLatestCommit (pat : String) (upstream : String) (prNumber : Nat) : IO String := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  runCmd "gh" #[
+    "api",
+    s!"/repos/{owner}/{repo}/pulls/{prNumber}",
+    "--jq", ".head.sha"
+  ] (env := env)
+
+/-- Create a new inline PR review comment on a specific file and line. -/
+def createPrReviewComment (pat : String) (upstream : String) (prNumber : Nat)
+    (body path : String) (line : Nat) (side : String) : IO String := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let commitId ← getPrLatestCommit pat upstream prNumber
+  let payload := Json.mkObj [
+    ("body", body),
+    ("path", path),
+    ("side", side),
+    ("commit_id", commitId),
+    ("line", Json.num ⟨(line : Int), 0⟩)
+  ]
+  runCmd "gh" #[
+    "api", "--method", "POST",
+    s!"/repos/{owner}/{repo}/pulls/{prNumber}/comments",
+    "--input", "-"
+  ] (input := payload.compress) (env := env)
+
+/-- Post a review (with optional inline comments) on a pull request. -/
+def createPrReview (pat : String) (upstream : String) (prNumber : Nat)
+    (body : String) (comments : Array InlineComment := #[]) : IO String := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let commitId ← if comments.isEmpty then pure ""
+                 else getPrLatestCommit pat upstream prNumber
+  let commentsJson := comments.map fun c =>
+    Json.mkObj [
+      ("path", c.path),
+      ("line", Json.num ⟨(c.line : Int), 0⟩),
+      ("body", c.body),
+      ("side", c.side)
+    ]
+  let baseFields : List (String × Json) :=
+    [("body", body), ("event", "COMMENT"), ("comments", Json.arr commentsJson)]
+  let payload := Json.mkObj (
+    baseFields ++ if commitId.isEmpty then [] else [("commit_id", Json.str commitId)])
+  runCmd "gh" #[
+    "api", "--method", "POST",
+    s!"/repos/{owner}/{repo}/pulls/{prNumber}/reviews",
+    "--input", "-"
+  ] (input := payload.compress) (env := env)
+
+/-- Return the pull-request number that a review comment belongs to. -/
+def getPrReviewCommentPrNumber (pat : String) (upstream : String) (commentId : Nat) : IO Nat := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let url ← runCmd "gh" #[
+    "api",
+    s!"/repos/{owner}/{repo}/pulls/comments/{commentId}",
+    "--jq", ".pull_request_url"
+  ] (env := env)
+  let trimmed : String := url.trimAscii.toString
+  match trimmed.splitOn "/" |>.getLast? with
+  | some s => match s.toNat? with
+    | some n => return n
+    | none => throw (.userError s!"unexpected pull_request_url: {trimmed}")
+  | none => throw (.userError s!"unexpected pull_request_url: {trimmed}")
 
 end Orchestra.GitHub

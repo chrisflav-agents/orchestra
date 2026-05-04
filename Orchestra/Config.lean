@@ -203,6 +203,9 @@ structure IOTask (i o : ResultType) where
   /-- Priority of this task. Natural number; higher = more important.
       Defaults to 10 if not set. -/
   priority : Nat := 10
+  /-- Issue or PR number this task was launched from.
+      When set, enables the `comment` tool to post to that issue/PR. -/
+  issueNumber : Option Nat := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -296,10 +299,12 @@ instance : FromJson Task where
     let authSource := j.getObjValAs? String "auth_source"    |>.toOption
     let tools      := j.getObjValAs? (List String) "tools"   |>.toOption
     let readOnly   := j.getObjValAs? Bool "read_only"        |>.toOption |>.getD false
-    let series     := j.getObjValAs? String "series"         |>.toOption
-    let priority   := j.getObjValAs? Nat "priority"          |>.toOption |>.getD 10
+    let series      := j.getObjValAs? String "series"          |>.toOption
+    let priority    := j.getObjValAs? Nat "priority"           |>.toOption |>.getD 10
+    let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
     return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, prependPrompt, backend, model,
-                                budget, memory, authSource, tools, readOnly, series, priority } }
+                                budget, memory, authSource, tools, readOnly, series, priority,
+                                issueNumber } }
 
 structure AppConfig where
   appId : Nat

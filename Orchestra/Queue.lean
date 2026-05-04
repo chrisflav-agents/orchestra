@@ -128,6 +128,8 @@ structure QueueEntry where
   inputJson     : Option Json    := none
   /-- Serialized task output, written by the daemon after the task completes. -/
   outputJson    : Option Json    := none
+  /-- Issue or PR number this task was launched from. Enables the `comment` tool. -/
+  issueNumber : Option Nat := none
 
 instance : ToJson QueueEntry where
   toJson e :=
@@ -159,8 +161,9 @@ instance : ToJson QueueEntry where
     let fields := if let some s := e.concertId      then fields ++ [("concert_id",       Json.str s)]                  else fields
     let fields := if e.inputType != .unit           then fields ++ [("input_type",       ToJson.toJson e.inputType)]   else fields
     let fields := if e.outputType != .unit          then fields ++ [("output_type",      ToJson.toJson e.outputType)]  else fields
-    let fields := if let some j := e.inputJson      then fields ++ [("input_json",       j)]                           else fields
-    let fields := if let some j := e.outputJson     then fields ++ [("output_json",      j)]                           else fields
+    let fields := if let some j := e.inputJson       then fields ++ [("input_json",          j)]                           else fields
+    let fields := if let some j := e.outputJson      then fields ++ [("output_json",         j)]                           else fields
+    let fields := if let some n := e.issueNumber then fields ++ [("issue_number", Json.num n)] else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -191,12 +194,14 @@ instance : FromJson QueueEntry where
     let concertId      := j.getObjValAs? String    "concert_id"       |>.toOption
     let inputType      := j.getObjValAs? ResultType "input_type"      |>.toOption |>.getD .unit
     let outputType     := j.getObjValAs? ResultType "output_type"     |>.toOption |>.getD .unit
-    let inputJson      := j.getObjVal?   "input_json"  |>.toOption
-    let outputJson     := j.getObjVal?   "output_json" |>.toOption
+    let inputJson        := j.getObjVal?   "input_json"          |>.toOption
+    let outputJson       := j.getObjVal?   "output_json"         |>.toOption
+    let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
-             concertStepKey, concertId, inputType, outputType, inputJson, outputJson }
+             concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
+             issueNumber }
 
 -- Directories and paths
 

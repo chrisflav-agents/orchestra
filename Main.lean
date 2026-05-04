@@ -385,11 +385,12 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         model         := task.ioTask.model
         continuesFrom, series
         configPath
-        budget       := budgetFlag.orElse (fun _ => task.ioTask.budget)
-        authSource   := task.ioTask.authSource
-        tools        := task.ioTask.tools
-        readOnly     := task.ioTask.readOnly
-        priority     := priorityFlag.getD task.ioTask.priority
+        budget           := budgetFlag.orElse (fun _ => task.ioTask.budget)
+        authSource       := task.ioTask.authSource
+        tools            := task.ioTask.tools
+        readOnly         := task.ioTask.readOnly
+        priority         := priorityFlag.getD task.ioTask.priority
+        issueNumber      := task.ioTask.issueNumber
       }
       let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
       let _ ← daemonRequest req
@@ -567,21 +568,22 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
     let task : Task := {
       i := entry.inputType, o := entry.outputType
       ioTask := {
-        upstream     := entry.upstream
-        fork         := entry.fork
-        mode         := entry.mode
-        prompt       := entry.prompt
-        agent        := entry.agent
-        systemPrompt := entry.systemPrompt
-        prependPrompt := entry.prependPrompt
-        backend      := entry.backend
-        model        := entry.model
-        budget       := entry.budget
-        memory       := entry.memory
-        authSource   := entry.authSource
-        tools        := entry.tools
-        readOnly     := entry.readOnly
-        priority     := entry.priority
+        upstream         := entry.upstream
+        fork             := entry.fork
+        mode             := entry.mode
+        prompt           := entry.prompt
+        agent            := entry.agent
+        systemPrompt     := entry.systemPrompt
+        prependPrompt    := entry.prependPrompt
+        backend          := entry.backend
+        model            := entry.model
+        budget           := entry.budget
+        memory           := entry.memory
+        authSource       := entry.authSource
+        tools            := entry.tools
+        readOnly         := entry.readOnly
+        priority         := entry.priority
+        issueNumber := entry.issueNumber
       }
     }
     let cfg ← match entry.configPath with
