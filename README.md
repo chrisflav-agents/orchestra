@@ -162,12 +162,14 @@ Fields:
 
 ## MCP tools
 
-The agent has access to the following tools via the built-in MCP server:
+The agent has access to the following tools via the built-in MCP server. `health`, `refresh_token`,
+and `get_pr_comments` are always available; `create_pr` and `comment` must be enabled explicitly by
+adding them to the `tools` list in the task configuration.
 
 - `health` — check that the MCP server is running
 - `refresh_token` — refresh the GitHub App installation token
 - `get_pr_comments` — fetch review threads for a pull request
-- `create_pr` — create a pull request on the upstream repository (requires `mode: "pr"`)
+- `create_pr` — create a pull request on the upstream repository
 - `comment` — post a comment on the issue or pull request the task was launched from.
   Supports four modes:
   - **regular comment**: provide only `body`
