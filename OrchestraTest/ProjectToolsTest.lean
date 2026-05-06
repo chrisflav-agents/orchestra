@@ -166,4 +166,52 @@ def decideApproveCallsHook : Test := do
   TestM.assert msgOk     "decide_issue approve should report enqueued merger"
   TestM.assert wasCalled "enqueueMerger hook should have been invoked"
 
+@[test]
+def parseSplitIssueRejectsEmptyChildren : Test := do
+  let args := Json.mkObj
+    [ ("parent_id", "p"), ("reason", "too big"), ("children", Json.arr #[]) ]
+  match tryParseToolCall "split_issue" args with
+  | some (.error _) => TestM.assert true "empty children rejected"
+  | other => TestM.fail s!"expected error, got {repr other}"
+
+@[test]
+def splitIssueHappyPath : Test := do
+  let outcome ← (withTempHome do
+    let project ← setupProject
+    let parent ← addOpenIssue project.id "big task"
+    let mgr ← ClaimManager.new
+    let env := baseEnv [workIssuesPerm] (mgr := some mgr) (taskId := "T1")
+    let _ ← evalProjectTool env (.claimIssue parent.id)
+    let children : Array NewSubissueSpec := #[
+      { title := "part 1", description := "do x" },
+      { title := "part 2", description := "do y" } ]
+    let r ← evalProjectTool env (.splitIssue parent.id children "too big for one go")
+    let updatedParent ← loadIssue project.id parent.id
+    let allIssues ← loadIssues project.id
+    let claimAfter ← loadClaim project.id parent.id
+    return ( jsonContains r "\"ok\":true"
+           , updatedParent.map (·.status)
+           , allIssues.size
+           , claimAfter.isNone))
+  let (ok, parentStatus, count, claimGone) := outcome
+  TestM.assert ok                   "split_issue should report success"
+  TestM.assertEqual parentStatus (some .blocked) (msg := "parent moves to blocked")
+  TestM.assertEqual count 3         (msg := "parent + 2 children = 3 issues")
+  TestM.assert claimGone            "claim file should be deleted after split"
+
+@[test]
+def splitIssueRequiresOwnership : Test := do
+  let denied ← (withTempHome do
+    let project ← setupProject
+    let parent ← addOpenIssue project.id
+    let mgr ← ClaimManager.new
+    -- T1 claims, but T2 tries to split.
+    let _ ← evalProjectTool (baseEnv [workIssuesPerm] (mgr := some mgr) (taskId := "T1"))
+              (.claimIssue parent.id)
+    let r ← evalProjectTool (baseEnv [workIssuesPerm] (mgr := some mgr) (taskId := "T2"))
+              (.splitIssue parent.id
+                #[{ title := "x", description := "y" }] "stealing")
+    return jsonContains r "held by task T1")
+  TestM.assert denied "non-holder must be rejected"
+
 end OrchestraTest.ProjectTools

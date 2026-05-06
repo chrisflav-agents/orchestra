@@ -28,6 +28,14 @@ inductive ReviewDecision where
   | reject
 deriving Repr, Inhabited
 
+/-- One sub-issue spec passed to `split_issue`. Per-child target is optional;
+    when `none`, the child inherits the parent's `effectiveTarget`. -/
+structure NewSubissueSpec where
+  title       : String
+  description : String
+  target      : Option RepoTarget := none
+deriving Repr, Inhabited
+
 inductive ProjectTool where
   -- manage_issues
   | listProjects
@@ -43,6 +51,9 @@ inductive ProjectTool where
   | claimIssue       (issueId : IssueId)
   | releaseClaim     (issueId : IssueId) (reason : String)
   | attachPr         (issueId : IssueId) (repo : Repository) (number : Nat) (branch : String)
+  /-- Worker-driven decomposition: replace the held parent issue with a set of
+      sub-issues, move the parent to `.blocked`, and release the claim. -/
+  | splitIssue       (parentId : IssueId) (children : Array NewSubissueSpec) (reason : String)
   -- review_issues
   | listIssuesInReview (projectId : ProjectId)
   | decideIssue        (issueId : IssueId) (decision : ReviewDecision) (notes : String)
@@ -144,6 +155,29 @@ def toolDefs : List (String × String × Json) :=
             [ ("issue_id", strProp "Issue ID")
             , ("reason", strProp "Free-text reason recorded in the response") ]
             ["issue_id", "reason"]) ])
+  , (workIssuesPerm, "split_issue",
+      Json.mkObj
+        [ ("name", "split_issue")
+        , ("description",
+            "Decompose the issue this task currently holds into one or more sub-issues. " ++
+            "The parent moves to `blocked`, the claim is released, and the children become " ++
+            "open and pickable. Caller MUST hold the claim on `parent_id`. Each child " ++
+            "inherits the parent's effective target unless target_repo + target_branch are set.")
+        , ("inputSchema", obj
+            [ ("parent_id", strProp "ID of the issue this task currently holds")
+            , ("reason",    strProp "Why the issue needed to be split (recorded in the response)")
+            , ("children",  Json.mkObj
+                [ ("type", "array")
+                , ("description", "Sub-issues to create. Order is preserved.")
+                , ("items", Json.mkObj
+                    [ ("type", "object")
+                    , ("properties", Json.mkObj
+                        [ ("title", strProp "Sub-issue title")
+                        , ("description", strProp "Sub-issue description (markdown allowed)")
+                        , ("target_repo", strProp "Optional sub-issue target repo (owner/name)")
+                        , ("target_branch", strProp "Optional sub-issue target branch") ])
+                    , ("required", Json.arr #["title", "description"]) ]) ]) ]
+            ["parent_id", "reason", "children"]) ])
   , (workIssuesPerm, "attach_pr",
       Json.mkObj
         [ ("name", "attach_pr")
@@ -183,6 +217,7 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "open"      => some .open
   | "claimed"   => some .claimed
   | "in_review" => some .inReview
+  | "blocked"   => some .blocked
   | "completed" => some .completed
   | "abandoned" => some .abandoned
   | _           => none
@@ -259,6 +294,20 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
       let branch ← args.getObjValAs? String "branch"
       let repo   ← Repository.parse repoS
       return .attachPr ⟨iid⟩ repo number branch
+  | "split_issue" =>
+    some <| do
+      let parentS ← args.getObjValAs? String "parent_id"
+      let reason  ← args.getObjValAs? String "reason"
+      let arr     ← args.getObjValAs? (Array Json) "children"
+      if arr.isEmpty then
+        Except.error "split_issue requires at least one child"
+      else
+        let children ← arr.mapM fun item => do
+          let title ← item.getObjValAs? String "title"
+          let descr ← item.getObjValAs? String "description"
+          let target ← parseTarget? item
+          (Except.ok { title, description := descr, target } : Except String NewSubissueSpec)
+        return .splitIssue ⟨parentS⟩ children reason
   | "list_issues_in_review" =>
     some <| do
       let pid ← args.getObjValAs? String "project_id"
@@ -316,6 +365,7 @@ private def issueStatusToString : IssueStatus → String
   | .open      => "open"
   | .claimed   => "claimed"
   | .inReview  => "in_review"
+  | .blocked   => "blocked"
   | .completed => "completed"
   | .abandoned => "abandoned"
 
@@ -481,6 +531,50 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         | _, _ => pure ""
       return content
         s!"attached {repo}#{number} to {iid.value}; issue moved to in_review{reviewerNote}"
+  | .splitIssue parentId children reason =>
+    if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)
+    let some mgr := env.claimManager
+      | return content "claim manager not available in this context" (isError := true)
+    let some taskId := env.taskId
+      | return content "no task id in context (cannot verify claim ownership)" (isError := true)
+    match ← findIssue parentId with
+    | none => return content s!"issue {parentId.value} not found" (isError := true)
+    | some (project, parent) =>
+      -- Caller must already hold the claim on this parent. We don't allow
+      -- workers to split issues they don't own — that would let a stray
+      -- agent rearrange someone else's work.
+      match ← loadClaim project.id parentId with
+      | none =>
+        return content s!"cannot split {parentId.value}: not currently claimed" (isError := true)
+      | some claim =>
+        if claim.taskId != taskId then
+          return content
+            s!"cannot split {parentId.value}: held by task {claim.taskId}, not this task"
+            (isError := true)
+        else
+          let inheritedTarget := effectiveTarget project parent
+          let mut createdIds : Array String := #[]
+          for spec in children do
+            let iid ← freshIssueId
+            let issue : Issue :=
+              { id := iid, projectId := project.id
+              , parentId := some parentId
+              , title := spec.title, description := spec.description
+              , target := spec.target <|> inheritedTarget
+              , createdAt := now, updatedAt := now }
+            saveIssue issue
+            createdIds := createdIds.push iid.value
+          -- Move parent to .blocked and clear the claim. We don't reuse
+          -- `release` here because it sets status unconditionally; we want
+          -- `.blocked` specifically.
+          saveIssue { parent with status := .blocked, updatedAt := now }
+          let _ ← forceRelease mgr project.id parentId
+          let payload := Json.mkObj
+            [ ("ok",         true)
+            , ("parent_id",  Json.str parentId.value)
+            , ("reason",     Json.str reason)
+            , ("created",    Json.arr (createdIds.map Json.str)) ]
+          return content payload.compress
   -- ---------------- review_issues ----------------
   | .listIssuesInReview pid =>
     if !has env reviewIssuesPerm then return content (deny reviewIssuesPerm) (isError := true)

@@ -62,6 +62,9 @@ inductive IssueStatus where
   | open
   | claimed
   | inReview
+  /-- Parent issue split into sub-issues by a worker; not pickable until
+      either a reviewer / human moves it forward, or you manually re-open. -/
+  | blocked
   | completed
   | abandoned
 deriving Repr, Inhabited, BEq, DecidableEq
@@ -71,6 +74,7 @@ instance : ToJson IssueStatus where
     | .open      => "open"
     | .claimed   => "claimed"
     | .inReview  => "in_review"
+    | .blocked   => "blocked"
     | .completed => "completed"
     | .abandoned => "abandoned"
 
@@ -79,6 +83,7 @@ instance : FromJson IssueStatus where
     | .str "open"      => .ok .open
     | .str "claimed"   => .ok .claimed
     | .str "in_review" => .ok .inReview
+    | .str "blocked"   => .ok .blocked
     | .str "completed" => .ok .completed
     | .str "abandoned" => .ok .abandoned
     | j => .error s!"expected issue status string, got {j}"

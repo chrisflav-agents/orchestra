@@ -45,6 +45,7 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "claimed"   => some .claimed
   | "in_review" => some .inReview
   | "completed" => some .completed
+  | "blocked"   => some .blocked
   | "abandoned" => some .abandoned
   | _           => none
 
@@ -52,6 +53,7 @@ private def issueStatusToString : IssueStatus → String
   | .open      => "open"
   | .claimed   => "claimed"
   | .inReview  => "in_review"
+  | .blocked   => "blocked"
   | .completed => "completed"
   | .abandoned => "abandoned"
 
