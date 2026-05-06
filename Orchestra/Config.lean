@@ -240,6 +240,10 @@ structure IOTask (i o : ResultType) where
   /-- Orchestra issue this task is working on (optional).
       Set by `claim_issue`; release on terminal status flips it back to `.open`. -/
   issueId : Option IssueId := none
+  /-- Optional role name this task was spawned for (e.g. "implementor"). Used
+      by the project-dispatcher to count active per-role tasks unambiguously,
+      avoiding fragile `tools` list comparisons. -/
+  role : Option String := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -338,9 +342,10 @@ instance : FromJson Task where
     let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
     let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
     let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
+    let role        := j.getObjValAs? String    "role"       |>.toOption
     return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, authSource, tools, readOnly, series, priority,
-                                issueNumber, projectId, issueId } }
+                                issueNumber, projectId, issueId, role } }
 
 /-- Filesystem paths to expose inside the landrun sandbox. -/
 structure SandboxPaths where

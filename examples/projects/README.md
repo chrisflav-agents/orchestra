@@ -52,5 +52,47 @@ orchestra issue close <issue-id>      # marks abandoned (review flow handles com
 Tool permission groups (set via the task config's `tools` list):
 
 - `manage_issues` — plan agents: list / create / update issues + sub-issues.
-- `work_issues` — worker agents: list open issues, claim, attach PR, release.
+- `work_issues` — worker agents: list open issues, claim, attach PR, release, split into sub-issues.
 - `review_issues` — reviewer agents: list in-review, approve / reject.
+
+## Roles
+
+A *role* is a reusable task template — backend, prompt template, the
+permission set the agent gets, and an optional auto-dispatch policy.
+Role names are user-defined; only the dispatcher's set of triggers is
+fixed (`has_open_issues` | `has_in_review_issues` | `idle`).
+
+Files (project overrides global by name):
+
+```
+~/.agent/roles/<name>.json                       -- global
+~/.agent/projects/<pid>/roles/<name>.json        -- per-project override
+```
+
+Examples in `roles/`: `implementor.json`, `reviewer.json`, `planner.json`.
+Each ships with `dispatch.max: 0` so auto-spawn is opt-in — set caps in a
+dispatcher listener config (see `examples/listeners/auto-dispatcher.json`)
+to enable.
+
+Manual spawning:
+
+```sh
+orchestra roles list <project-id>                       # see what's available
+orchestra spawn <role-name> <project-id> [--prompt ...]  # ad-hoc spawn
+orchestra spawn implementor <project-id> --issue <iid>   # pre-claims via daemon
+```
+
+Auto-dispatch listener:
+
+```json
+{
+  "source": {
+    "type": "project-dispatcher",
+    "project_id": "<pid>",
+    "caps": { "implementor": 2, "reviewer": 1, "planner": 1 }
+  },
+  "interval_seconds": 30
+}
+```
+
+Each tick the dispatcher counts queue entries `(status ∈ {pending, running}) ∧ projectId == this ∧ role == X`, and if `count < cap` and the role's trigger holds, enqueues exactly one new entry per role.

@@ -136,6 +136,9 @@ structure QueueEntry where
   projectId : Option ProjectId := none
   /-- Orchestra issue this entry is working on (optional). -/
   issueId : Option IssueId := none
+  /-- Optional role name (mirrors `IOTask.role`). Used by the dispatcher to
+      count per-role active tasks unambiguously. -/
+  role : Option String := none
 
 instance : ToJson QueueEntry where
   toJson e :=
@@ -172,6 +175,7 @@ instance : ToJson QueueEntry where
     let fields := if let some n := e.issueNumber then fields ++ [("issue_number", Json.num n)] else fields
     let fields := if let some p := e.projectId then fields ++ [("project_id", ToJson.toJson p)] else fields
     let fields := if let some i := e.issueId   then fields ++ [("issue_id",   ToJson.toJson i)] else fields
+    let fields := if let some r := e.role      then fields ++ [("role",       Json.str r)]      else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -207,11 +211,12 @@ instance : FromJson QueueEntry where
     let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
     let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
     let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
+    let role        := j.getObjValAs? String    "role"       |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
-             issueNumber, projectId, issueId }
+             issueNumber, projectId, issueId, role }
 
 -- Directories and paths
 

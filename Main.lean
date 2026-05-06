@@ -221,7 +221,7 @@ private def tagHandler (p : Parsed) : IO UInt32 := do
 -- The project / issue subcommands live in `Orchestra.Project.Cli` so the
 -- domain code stays self-contained. We only re-export the top-level cmds
 -- here so the macro that builds `orchestraCmd` can find them by name.
-open Orchestra.Project.Cli (projectCmd issueCmd)
+open Orchestra.Project.Cli (projectCmd issueCmd spawnCmd rolesCmd)
 
 private def resumeHandler (p : Parsed) : IO UInt32 := do
   let seriesName := p.positionalArg! "series" |>.as! String
@@ -469,6 +469,12 @@ private def handleSocketRequest
               token.cancel .cancel
           shutdownToken.cancel .shutdown
           pure DaemonRequest.DaemonResponse.ok
+        | .claimIssue pid iid taskId agent series =>
+          let now ← TaskStore.currentIso8601
+          match ← Project.tryClaim TaskRunner.globalClaimManager pid iid taskId agent now series with
+          | .acquired _            => pure (.withId taskId)
+          | .alreadyClaimed exist  => pure (.error s!"already_claimed by task {exist.taskId}")
+          | .invalid reason        => pure (.error reason)
     conn.sendLine (Lean.ToJson.toJson response).compress
   catch e =>
     IO.eprintln s!"Socket request error: {e}"
@@ -649,6 +655,49 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           let events ← Listener.pollSource lcfg.source state appConfig.pat
             appConfig.authorizedUsers
           for (_, vars) in (events : Array (String × List (String × String))) do
+            -- Project-dispatcher source: synthetic events carry only `role_name`
+            -- and (optionally) `issue_id`. Build the queue entry directly from
+            -- the named role template, pre-claiming through the in-process
+            -- ClaimManager when the role wants it.
+            match lcfg.source with
+            | .projectDispatcher pid _ =>
+              let roleName := vars.find? (·.1 == "role_name") |>.map (·.2) |>.getD ""
+              let issueId := vars.find? (·.1 == "issue_id") |>.map (fun p => (⟨p.2⟩ : Project.IssueId))
+              let some project ← Project.loadProject pid | continue
+              let some role ← Project.loadRole pid roleName | continue
+              let issue? : Option Project.Issue ← match issueId with
+                | none => pure none
+                | some iid => Project.loadIssue pid iid
+              let entryOpt ← Listener.buildRoleEntry project role issue?
+              match entryOpt with
+              | none =>
+                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName}: no effective target"
+              | some entry =>
+                -- Pre-claim if the role wants it and we have an issue.
+                let needsClaim :=
+                  match role.dispatch with
+                  | some d => d.preClaim
+                  | none   => false
+                let claimed ← match needsClaim, issue? with
+                  | true, some i =>
+                    let now ← TaskStore.currentIso8601
+                    let agent := role.backend.getD "claude"
+                    match ← Project.tryClaim TaskRunner.globalClaimManager pid i.id
+                                             entry.id agent now none with
+                    | .acquired _ => pure true
+                    | .alreadyClaimed e =>
+                      IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: \
+                        issue {i.id.value} already claimed by {e.taskId}"
+                      pure false
+                    | .invalid r =>
+                      IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: {r}"
+                      pure false
+                  | _, _ => pure true
+                if claimed then
+                  Queue.saveEntry entry
+                  IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} → {entry.id}"
+              continue
+            | _ => pure ()
             if let some wfPath := lcfg.action.workflowPath then
               -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
               let resolvedPath := Listener.renderTemplate wfPath vars
@@ -1085,7 +1134,9 @@ def orchestraCmd : Cmd := `[Cli|
     resumeCmd;
     queueCmd;
     projectCmd;
-    issueCmd
+    issueCmd;
+    spawnCmd;
+    rolesCmd
 ]
 
 def main (args : List String) : IO UInt32 := do

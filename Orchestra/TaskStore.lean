@@ -65,6 +65,8 @@ structure TaskRecord where
   projectId     : Option ProjectId := none
   /-- Orchestra issue this task is/was working on (optional). -/
   issueId       : Option IssueId   := none
+  /-- Optional role name. -/
+  role          : Option String    := none
 deriving Repr
 
 instance : ToJson TaskRecord where
@@ -91,6 +93,7 @@ instance : ToJson TaskRecord where
     let fields := if r.priority != 10           then fields ++ [("priority",         Json.num r.priority)] else fields
     let fields := if let some p := r.projectId   then fields ++ [("project_id",       ToJson.toJson p)]    else fields
     let fields := if let some i := r.issueId     then fields ++ [("issue_id",         ToJson.toJson i)]    else fields
+    let fields := if let some s := r.role        then fields ++ [("role",             Json.str s)]         else fields
     Json.mkObj fields
 
 instance : FromJson TaskRecord where
@@ -114,9 +117,10 @@ instance : FromJson TaskRecord where
     let priority      := j.getObjValAs? Nat   "priority"      |>.toOption |>.getD 10
     let projectId     := j.getObjValAs? ProjectId "project_id" |>.toOption
     let issueId       := j.getObjValAs? IssueId   "issue_id"   |>.toOption
+    let role          := j.getObjValAs? String    "role"       |>.toOption
     return { id, createdAt, upstream, fork, mode, prompt, status, sessionId,
              continuesFrom, series, backend, model, agent, systemPrompt, prependPrompt, budget, priority,
-             projectId, issueId }
+             projectId, issueId, role }
 
 -- Directories
 

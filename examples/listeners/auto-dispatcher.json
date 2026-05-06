@@ -1,0 +1,17 @@
+{
+  "name": "demo-dispatcher",
+  "source": {
+    "type": "project-dispatcher",
+    "project_id": "0123456789abcdef",
+    "caps": {
+      "implementor": 2,
+      "reviewer":    1,
+      "planner":     1
+    }
+  },
+  "action": {
+    "mode": "pr",
+    "prompt_template": ""
+  },
+  "interval_seconds": 30
+}

@@ -1,17 +1,22 @@
 import Cli
 import Orchestra.Config
 import Orchestra.Queue
+import Orchestra.DaemonRequest
 import Orchestra.TaskStore
+import Orchestra.Utils.UnixSocket
 import Orchestra.Project.Basic
 import Orchestra.Project.Claim
+import Orchestra.Project.Role
 
 open Cli
 open Orchestra (Repository Task)
 open Orchestra.TaskStore (currentIso8601)
 open Orchestra.Project (Project Issue ProjectId IssueId IssueStatus RepoTarget
+                        Role RoleTrigger DispatchPolicy
                         loadProject saveProject loadAllProjects
                         loadIssue saveIssue loadIssues childrenOf findIssue
-                        freshProjectId freshIssueId effectiveTarget)
+                        freshProjectId freshIssueId effectiveTarget
+                        loadRole loadAllRoles roleSearchPaths render renderVarsFor)
 
 namespace Orchestra.Project.Cli
 
@@ -196,6 +201,145 @@ def issueShowHandler (p : Parsed) : IO UInt32 := do
       IO.println s!"  {line}"
     return (0 : UInt32)
 
+/-! ## Daemon socket helper for pre-claim
+
+Pre-claiming an issue must go through the daemon's `ClaimManager` so the
+in-process mutex serialises CLI claims against agent claims. We talk to the
+daemon over the same UNIX socket that `enqueueHandler` uses, sending a
+`claim_issue` request and parsing the structured response. -/
+
+private def daemonClaim (pid : ProjectId) (iid : IssueId) (taskId : String)
+    (agent : String) (series : Option String) : IO (Except String Unit) := do
+  if !(← Queue.daemonRunning) then
+    return .error "queue daemon is not running (start it with 'orchestra queue start')"
+  let socketPath ← Queue.socketFile
+  let conn ← Utils.UnixSocket.Connection.connect socketPath
+  let req := Lean.Json.mkObj
+    [ ("type",       "claim_issue")
+    , ("project_id", Lean.Json.str pid.value)
+    , ("issue_id",   Lean.Json.str iid.value)
+    , ("task_id",    Lean.Json.str taskId)
+    , ("agent",      Lean.Json.str agent)
+    , match series with
+      | some s => ("series", Lean.Json.str s)
+      | none   => ("series", Lean.Json.null) ]
+  conn.sendLine req.compress
+  let line ← conn.recvLine
+  conn.close
+  match Lean.Json.parse line with
+  | .error e => return .error s!"invalid daemon response: {e}"
+  | .ok j =>
+    if let .ok msg := j.getObjValAs? String "error" then
+      return .error msg
+    return .ok ()
+
+/-! ## Spawn handler -/
+
+private def renderTargetStr : RepoTarget → String
+  | { repo, branch } => s!"{repo}@{branch}"
+
+def spawnHandler (p : Parsed) : IO UInt32 := do
+  let roleName := p.positionalArg! "role"       |>.as! String
+  let pidStr   := p.positionalArg! "project-id" |>.as! String
+  let issueIdFlag : Option IssueId := p.flag? "issue" |>.map (fun v => ⟨v.as! String⟩)
+  let extraInstructions := p.flag? "prompt" |>.map (·.as! String) |>.getD ""
+  -- 1. Resolve project + role.
+  let project ← match ← loadProject ⟨pidStr⟩ with
+    | none => IO.eprintln s!"Project '{pidStr}' not found"; return 1
+    | some pr => pure pr
+  let role ← match ← loadRole project.id roleName with
+    | some r => pure r
+    | none =>
+      let (pPath, gPath) ← roleSearchPaths project.id roleName
+      IO.eprintln s!"Role '{roleName}' not found. Searched:"
+      IO.eprintln s!"  {pPath}"
+      IO.eprintln s!"  {gPath}"
+      return 1
+  -- 2. Optionally bind an issue + pre-claim.
+  let mIssue : Option Issue ← match issueIdFlag with
+    | none => pure none
+    | some iid =>
+      match ← loadIssue project.id iid with
+      | none =>
+        IO.eprintln s!"Issue '{iid.value}' not found in project {project.id.value}"
+        return 1
+      | some i => pure (some i)
+  -- 3. Determine pre-claim. Required for the issue to be safely held.
+  let shouldPreClaim :=
+    match mIssue, role.dispatch with
+    | some _, some d => d.preClaim
+    | some _, none   => true   -- default: if user gave --issue, claim it
+    | none,   _      => false
+  -- 4. Build the queue entry first (we need its id as the claim's task id).
+  let entryId ← TaskStore.generateId
+  let createdAt ← currentIso8601
+  let target := mIssue.bind (effectiveTarget project ·)
+            <|> project.defaultTarget
+  let some target' := target
+    | IO.eprintln "Cannot spawn: no effective target (project has no default and issue has no override)"
+      return 1
+  let vars := renderVarsFor project mIssue extraInstructions
+  let prompt := render role.promptTemplate vars
+  let entry : Queue.QueueEntry :=
+    { id := entryId, createdAt
+    , upstream      := target'.repo
+    , fork          := target'.repo
+    , mode          := .pr
+    , prompt
+    , backend       := role.backend
+    , model         := role.model
+    , systemPrompt  := role.systemPrompt
+    , prependPrompt := role.prependPrompt
+    , budget        := role.budget
+    , priority      := role.priority
+    , readOnly      := role.readOnly
+    , tools         := some role.permissions
+    , projectId     := some project.id
+    , issueId       := mIssue.map (·.id)
+    , role          := some role.name }
+  -- 5. Pre-claim if requested. We claim *before* writing the entry so a
+  --    failed claim leaves no orphan queue entry.
+  if shouldPreClaim then
+    let some issue := mIssue
+      | IO.eprintln "internal: pre-claim requested without --issue"; return (1 : UInt32)
+    let agent := role.backend.getD "claude"
+    match ← daemonClaim project.id issue.id entryId agent none with
+    | .error msg =>
+      IO.eprintln s!"Pre-claim failed: {msg}"
+      return (1 : UInt32)
+    | .ok () => pure ()
+  -- 6. Persist the entry. The daemon picks it up on its next poll.
+  Queue.saveEntry entry
+  IO.println entryId
+  return (0 : UInt32)
+
+/-! ## Roles list -/
+
+private def renderTriggerStr : RoleTrigger → String
+  | .hasOpenIssues     => "has_open_issues"
+  | .hasInReviewIssues => "has_in_review_issues"
+  | .idle              => "idle"
+
+def rolesListHandler (p : Parsed) : IO UInt32 := do
+  let pidStr := p.positionalArg! "project-id" |>.as! String
+  let project ← match ← loadProject ⟨pidStr⟩ with
+    | none => IO.eprintln s!"Project '{pidStr}' not found"; return 1
+    | some pr => pure pr
+  let roles ← loadAllRoles project.id
+  if roles.isEmpty then
+    IO.println "No roles defined (looked under ~/.agent/projects/<pid>/roles and ~/.agent/roles)."
+    return 0
+  IO.println s!"{padRight "ROLE" 18} {padRight "PERMISSIONS" 36} TRIGGER  MAX  PRE-CLAIM"
+  IO.println (String.ofList (List.replicate 90 '-'))
+  for r in roles do
+    let perms := String.intercalate "," r.permissions
+    let (trig, maxStr, pcStr) := match r.dispatch with
+      | none   => ("-", "-", "-")
+      | some d => (renderTriggerStr d.trigger, toString d.max,
+                   if d.preClaim then "yes" else "no")
+    IO.println s!"{padRight r.name 18} {padRight perms 36} {padRight trig 8} {padRight maxStr 4} {pcStr}"
+  return 0
+
 /-- Default tools granted to a continuation that doesn't override `--tools`.
     Matches the canonical worker tool set: project work tools + PR + comment. -/
 private def defaultContinueTools : List String :=
@@ -205,7 +349,7 @@ def issueContinueHandler (p : Parsed) : IO UInt32 := do
   let id      := p.positionalArg! "id" |>.as! String
   let prompt? := p.flag? "prompt" |>.map (·.as! String)
   let toolsOverride? := p.flag? "tools" |>.map (fun v =>
-    (v.as! String).splitOn "," |>.map (·.trim) |>.filter (fun s => !s.isEmpty))
+    (v.as! String).splitOn "," |>.map (·.trimAscii.toString) |>.filter (fun s => !s.isEmpty))
   let priorityFlag := p.flag? "priority" |>.map (·.as! Nat)
   let prompt ← match prompt? with
     | some t => pure t
@@ -368,6 +512,37 @@ def issueCmd : Cmd := `[Cli|
     issueShowCmd;
     issueCloseCmd;
     issueContinueCmd
+]
+
+/-! ## Top-level spawn + roles commands -/
+
+def spawnCmd : Cmd := `[Cli|
+  spawn VIA spawnHandler; ["0.1.0"]
+  "Spawn a task for a role from a role template (~/.agent/roles/<role>.json or per-project)."
+
+  FLAGS:
+    issue    : String; "Bind the task to this issue (required for hasOpenIssues roles to pre-claim)"
+    p, prompt : String; "Free-form text passed as {{instructions}} to the role template"
+
+  ARGS:
+    "role"       : String; "Role name (filename in roles/ without .json)"
+    "project-id" : String; "Project ID"
+]
+
+private def rolesListCmd : Cmd := `[Cli|
+  list VIA rolesListHandler; ["0.1.0"]
+  "List role templates available for a project (project-scoped overrides global)."
+
+  ARGS:
+    "project-id" : String; "Project ID"
+]
+
+def rolesCmd : Cmd := `[Cli|
+  roles VIA subcommandDefault; ["0.1.0"]
+  "Inspect role templates."
+
+  SUBCOMMANDS:
+    rolesListCmd
 ]
 
 end Orchestra.Project.Cli
