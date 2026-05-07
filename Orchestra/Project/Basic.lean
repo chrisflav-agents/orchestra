@@ -67,6 +67,8 @@ inductive IssueStatus where
   | blocked
   | completed
   | abandoned
+  /-- PR failed the merger's validation check; not picked up again automatically. -/
+  | rejected
 deriving Repr, Inhabited, BEq, DecidableEq
 
 instance : ToJson IssueStatus where
@@ -77,6 +79,7 @@ instance : ToJson IssueStatus where
     | .blocked   => "blocked"
     | .completed => "completed"
     | .abandoned => "abandoned"
+    | .rejected  => "rejected"
 
 instance : FromJson IssueStatus where
   fromJson?
@@ -86,6 +89,7 @@ instance : FromJson IssueStatus where
     | .str "blocked"   => .ok .blocked
     | .str "completed" => .ok .completed
     | .str "abandoned" => .ok .abandoned
+    | .str "rejected"  => .ok .rejected
     | j => .error s!"expected issue status string, got {j}"
 
 /-! ## Project record -/

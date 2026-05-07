@@ -224,13 +224,17 @@ structure ListenerConfig where
   source          : SourceConfig
   action          : ActionConfig
   intervalSeconds : Nat := 60
+  /-- When false, the daemon's polling fiber skips this listener until re-enabled.
+      Re-checked on every tick so the toggle takes effect without a daemon restart. -/
+  enabled         : Bool := true
 
 instance : ToJson ListenerConfig where
   toJson l := Json.mkObj [
     ("name",             l.name),
     ("source",           ToJson.toJson l.source),
     ("action",           ToJson.toJson l.action),
-    ("interval_seconds", l.intervalSeconds)
+    ("interval_seconds", l.intervalSeconds),
+    ("enabled",          Json.bool l.enabled)
   ]
 
 instance : FromJson ListenerConfig where
@@ -239,7 +243,8 @@ instance : FromJson ListenerConfig where
     let source          ← j.getObjValAs? SourceConfig "source"
     let action          ← j.getObjValAs? ActionConfig "action"
     let intervalSeconds  := j.getObjValAs? Nat "interval_seconds" |>.toOption |>.getD 60
-    return { name, source, action, intervalSeconds }
+    let enabled          := j.getObjValAs? Bool "enabled" |>.toOption |>.getD true
+    return { name, source, action, intervalSeconds, enabled }
 
 -- Listener state
 
@@ -281,6 +286,11 @@ def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
     match FromJson.fromJson? j with
     | .error _ => return none
     | .ok cfg  => return some cfg
+
+def saveListenerConfig (cfg : ListenerConfig) : IO Unit := do
+  let dir ← listenersDir
+  IO.FS.createDirAll dir
+  IO.FS.writeFile (dir / s!"{cfg.name}.json") (Lean.Json.compress (ToJson.toJson cfg))
 
 def loadAllListenerConfigs (dir : System.FilePath) : IO (Array ListenerConfig) := do
   if !(← dir.pathExists) then return #[]

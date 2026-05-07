@@ -368,6 +368,7 @@ private def issueStatusToString : IssueStatus → String
   | .blocked   => "blocked"
   | .completed => "completed"
   | .abandoned => "abandoned"
+  | .rejected  => "rejected"
 
 /-- Render an issue summary line (used in list responses). -/
 private def issueLine (i : Issue) : String :=

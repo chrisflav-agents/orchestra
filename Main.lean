@@ -651,6 +651,10 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           IO.sleep (lcfg.intervalSeconds * 1000).toUInt32
         firstRun := false
         try
+          -- Re-read the config each tick so an enable/disable toggle takes
+          -- effect live without restarting the daemon.
+          let liveCfg := (← Listener.loadListenerConfig lcfg.name).getD lcfg
+          if !liveCfg.enabled then pure () else
           let state  ← Listener.loadListenerState lcfg.name
           let events ← Listener.pollSource lcfg.source state appConfig.pat
             appConfig.authorizedUsers
@@ -1097,6 +1101,66 @@ private def queueListenersCmd : Cmd := `[Cli|
     listener_dir : String; "Directory of listener configs (default: ~/.agent/listeners/)"
 ]
 
+/-! ## Auto-dispatch enable/disable
+
+Toggles the `enabled` flag on every listener config whose source is a
+`project-dispatcher` for the named project. The daemon re-reads each
+listener's config on every tick (Main.lean listener fiber) so the change
+takes effect on the next poll without restarting the daemon. -/
+
+private def toggleProjectDispatchers (pidStr : String) (enable : Bool) : IO UInt32 := do
+  let some _ ← Project.loadProject ⟨pidStr⟩
+    | IO.eprintln s!"Project '{pidStr}' not found"; return 1
+  let dir ← Listener.listenersDir
+  let configs ← Listener.loadAllListenerConfigs dir
+  let pid : Project.ProjectId := ⟨pidStr⟩
+  let matching := configs.filter (fun c =>
+    match c.source with
+    | .projectDispatcher p _ => p == pid
+    | _                       => false)
+  if matching.isEmpty then
+    IO.eprintln s!"No project-dispatcher listener found for project {pidStr} in {dir}"
+    return 1
+  for cfg in matching do
+    Listener.saveListenerConfig { cfg with enabled := enable }
+    IO.println s!"Listener '{cfg.name}': {if enable then "enabled" else "disabled"}"
+  return 0
+
+private def dispatchEnableHandler (p : Parsed) : IO UInt32 :=
+  toggleProjectDispatchers (p.positionalArg! "project-id" |>.as! String) true
+
+private def dispatchDisableHandler (p : Parsed) : IO UInt32 :=
+  toggleProjectDispatchers (p.positionalArg! "project-id" |>.as! String) false
+
+private def dispatchSubDefault (_ : Parsed) : IO UInt32 := do
+  IO.eprintln "Use 'enable' or 'disable'. Try '--help'."
+  return 1
+
+private def dispatchEnableCmd : Cmd := `[Cli|
+  enable VIA dispatchEnableHandler; ["0.1.0"]
+  "Enable the auto-dispatch listener(s) for a project."
+
+  ARGS:
+    "project-id" : String; "Project ID"
+]
+
+private def dispatchDisableCmd : Cmd := `[Cli|
+  disable VIA dispatchDisableHandler; ["0.1.0"]
+  "Disable the auto-dispatch listener(s) for a project (takes effect on next tick)."
+
+  ARGS:
+    "project-id" : String; "Project ID"
+]
+
+private def dispatchCmd : Cmd := `[Cli|
+  dispatch VIA dispatchSubDefault; ["0.1.0"]
+  "Enable/disable a project's auto-dispatch listener without restarting the daemon."
+
+  SUBCOMMANDS:
+    dispatchEnableCmd;
+    dispatchDisableCmd
+]
+
 private def queueCmd : Cmd := `[Cli|
   queue VIA queueListHandler; ["0.1.0"]
   "Manage the task queue."
@@ -1136,7 +1200,8 @@ def orchestraCmd : Cmd := `[Cli|
     projectCmd;
     issueCmd;
     spawnCmd;
-    rolesCmd
+    rolesCmd;
+    dispatchCmd
 ]
 
 def main (args : List String) : IO UInt32 := do

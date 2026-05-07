@@ -63,6 +63,7 @@ private def issueStatusToString : IssueStatus → String
   | .blocked   => "blocked"
   | .completed => "completed"
   | .abandoned => "abandoned"
+  | .rejected  => "rejected"
 
 /-! ## Handlers -/
 
@@ -405,6 +406,36 @@ def issueCloseHandler (p : Parsed) : IO UInt32 := do
     IO.println s!"Issue {i.id.value} marked abandoned"
     return (0 : UInt32)
 
+/-! ## Issue → tasks listing -/
+
+private def taskStatusToString : TaskStore.TaskStatus → String
+  | .running    => "running"
+  | .completed  => "completed"
+  | .failed     => "failed"
+  | .unfinished => "unfinished"
+  | .cancelled  => "cancelled"
+
+def issueTasksHandler (p : Parsed) : IO UInt32 := do
+  let id := p.positionalArg! "id" |>.as! String
+  let some (_project, issue) ← findIssue ⟨id⟩
+    | IO.eprintln s!"Issue '{id}' not found"; return 1
+  let all ← TaskStore.loadAllTasks
+  let matching := all.filter (fun r => r.issueId == some issue.id)
+  if matching.isEmpty then
+    IO.println s!"No tasks recorded for issue {issue.id.value}."
+    return 0
+  IO.println s!"{padRight "TASK ID" 18} {padRight "CREATED" 22} {padRight "STATUS" 11} {padRight "ROLE" 16} SERIES"
+  IO.println (String.ofList (List.replicate 90 '-'))
+  -- Sort newest first (TaskStore.loadAllTasks already does this, but be explicit).
+  let sorted := matching.qsort (fun a b => a.id > b.id)
+  for r in sorted do
+    let role   := r.role.getD "-"
+    let series := r.series.getD "-"
+    IO.println s!"{padRight r.id 18} {padRight r.createdAt 22} \
+      {padRight (taskStatusToString r.status) 11} {padRight role 16} {series}"
+  return 0
+
+
 /-! ## `Cli.Cmd` definitions -/
 
 private def subcommandDefault (_ : Parsed) : IO UInt32 := do
@@ -489,6 +520,14 @@ private def issueCloseCmd : Cmd := `[Cli|
     "id" : String; "Issue ID"
 ]
 
+private def issueTasksCmd : Cmd := `[Cli|
+  tasks VIA issueTasksHandler; ["0.1.0"]
+  "List all tasks recorded for an issue, newest first."
+
+  ARGS:
+    "id" : String; "Issue ID"
+]
+
 private def issueContinueCmd : Cmd := `[Cli|
   «continue» VIA issueContinueHandler; ["0.1.0"]
   "Enqueue a new task continuing the holder's series on a claimed issue."
@@ -511,7 +550,8 @@ def issueCmd : Cmd := `[Cli|
     issueListCmd;
     issueShowCmd;
     issueCloseCmd;
-    issueContinueCmd
+    issueContinueCmd;
+    issueTasksCmd
 ]
 
 /-! ## Top-level spawn + roles commands -/
