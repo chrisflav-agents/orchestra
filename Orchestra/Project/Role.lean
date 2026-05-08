@@ -195,15 +195,21 @@ def loadAllRoles (pid : ProjectId) : IO (Array Role) := do
 /-! ## Template rendering -/
 
 /-- Variables available to a role template. Issue-specific fields are `none`
-    for triggers that don't bind to one issue (e.g. planners). -/
+    for triggers that don't bind to one issue (e.g. planners).
+    Supports: {{project_id}}, {{project_name}}, {{instructions}},
+    {{issue_id}}, {{issue_title}}, {{target_repo}}, {{target_branch}},
+    {{pr_number}}, {{pr_branch}}, {{pr_repo}}. -/
 structure RenderVars where
   projectId    : String
   projectName  : String
   instructions : String
-  issueId      : Option String       := none
-  issueTitle   : Option String       := none
-  targetRepo   : Option String       := none
-  targetBranch : Option String       := none
+  issueId      : Option String := none
+  issueTitle   : Option String := none
+  targetRepo   : Option String := none
+  targetBranch : Option String := none
+  prNumber     : Option String := none
+  prBranch     : Option String := none
+  prRepo       : Option String := none
 deriving Repr, Inhabited
 
 /-- Substitute `{{name}}` placeholders. Unknown placeholders are left in place
@@ -216,23 +222,31 @@ def render (tmpl : String) (v : RenderVars) : String :=
     , ("{{issue_id}}",      v.issueId.getD "")
     , ("{{issue_title}}",   v.issueTitle.getD "")
     , ("{{target_repo}}",   v.targetRepo.getD "")
-    , ("{{target_branch}}", v.targetBranch.getD "") ]
+    , ("{{target_branch}}", v.targetBranch.getD "")
+    , ("{{pr_number}}",     v.prNumber.getD "")
+    , ("{{pr_branch}}",     v.prBranch.getD "")
+    , ("{{pr_repo}}",       v.prRepo.getD "") ]
   subs.foldl (fun acc (k, val) => acc.replace k val) tmpl
 
 /-- Build render vars for a project + optional issue. Pulls the effective
-    target from `effectiveTarget` so per-issue overrides are honoured. -/
+    target from `effectiveTarget` so per-issue overrides are honoured.
+    If the issue has attached PRs, the most recent one populates the pr_* vars. -/
 def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : String)
     : RenderVars :=
   match issue? with
   | none => { projectId := project.id.value, projectName := project.name, instructions }
   | some i =>
     let target := effectiveTarget project i
+    let pr? := i.attachedPRs.toList.reverse.head?
     { projectId    := project.id.value
     , projectName  := project.name
     , instructions
     , issueId      := some i.id.value
     , issueTitle   := some i.title
     , targetRepo   := target.map (·.repo.toString)
-    , targetBranch := target.map (·.branch) }
+    , targetBranch := target.map (·.branch)
+    , prNumber     := pr?.map (fun p => toString p.number)
+    , prBranch     := pr?.map (·.branch)
+    , prRepo       := pr?.map (·.repo.toString) }
 
 end Orchestra.Project

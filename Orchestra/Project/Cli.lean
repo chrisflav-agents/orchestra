@@ -101,6 +101,76 @@ def projectListHandler (_ : Parsed) : IO UInt32 := do
     IO.println s!"{padRight pr.id.value 18} {padRight pr.createdAt 22} {padRight pr.name 30} {target}"
   return (0 : UInt32)
 
+/-- Find all claimed issues in `pid` whose claiming task is missing and has no
+    active queue entry. Returns an array of `(issue, missingTaskId)` pairs. -/
+private def findOrphanedIssues (pid : ProjectId) : IO (Array (Issue × String)) := do
+  let issues ← loadIssues pid
+  let claimed := issues.filter (·.status == .claimed)
+  let allTasks ← TaskStore.loadAllTasks
+  let allEntries ← Queue.loadAllEntries
+  let activeEntries := allEntries.filter fun e =>
+    e.status == .pending || e.status == .running
+  let mut orphans : Array (Issue × String) := #[]
+  for issue in claimed do
+    let claim ← Project.loadClaim pid issue.id
+    let taskId := claim.map (·.taskId)
+    let hasTask := taskId.any (fun tid => allTasks.any (·.id == tid))
+    let onQueue := activeEntries.any (·.issueId == some issue.id)
+    if !hasTask && !onQueue then
+      orphans := orphans.push (issue, taskId.getD "(no claim file)")
+  return orphans
+
+def projectHealthHandler (p : Parsed) : IO UInt32 := do
+  let id := p.positionalArg! "id" |>.as! String
+  let pid : ProjectId := ⟨id⟩
+  match ← loadProject pid with
+  | none =>
+    IO.eprintln s!"Project '{id}' not found"
+    return (1 : UInt32)
+  | some _ =>
+    let issues ← loadIssues pid
+    let claimed := issues.filter (·.status == .claimed)
+    if claimed.isEmpty then
+      IO.println "All issues healthy (no claimed issues)."
+      return (0 : UInt32)
+    let allTasks ← TaskStore.loadAllTasks
+    let allEntries ← Queue.loadAllEntries
+    let activeEntries := allEntries.filter fun e =>
+      e.status == .pending || e.status == .running
+    let mut ok := true
+    for issue in claimed do
+      let claim ← Project.loadClaim pid issue.id
+      let taskId := claim.map (·.taskId)
+      let hasTask := taskId.any (fun tid => allTasks.any (·.id == tid))
+      if hasTask then
+        IO.println s!"[ok]      {issue.id.value}  {issue.title}"
+      else if activeEntries.any (·.issueId == some issue.id) then
+        IO.println s!"[ok]      {issue.id.value}  {issue.title}  — pending on queue"
+      else
+        ok := false
+        let tid := taskId.getD "(no claim file)"
+        IO.println s!"[orphan]  {issue.id.value}  {issue.title}  — claimed by missing task {tid}"
+    return if ok then 0 else 1
+
+def projectReleaseOrphansHandler (p : Parsed) : IO UInt32 := do
+  let id := p.positionalArg! "id" |>.as! String
+  let pid : ProjectId := ⟨id⟩
+  match ← loadProject pid with
+  | none =>
+    IO.eprintln s!"Project '{id}' not found"
+    return (1 : UInt32)
+  | some _ =>
+    let orphans ← findOrphanedIssues pid
+    if orphans.isEmpty then
+      IO.println "No orphaned claims found."
+      return (0 : UInt32)
+    let mgr ← Project.ClaimManager.new
+    let now ← TaskStore.currentIso8601
+    for (issue, tid) in orphans do
+      let _ ← Project.release mgr pid issue.id .open now
+      IO.println s!"[released]  {issue.id.value}  {issue.title}  (was claimed by {tid})"
+    return (0 : UInt32)
+
 def projectShowHandler (p : Parsed) : IO UInt32 := do
   let id := p.positionalArg! "id" |>.as! String
   match ← loadProject ⟨id⟩ with
@@ -197,6 +267,16 @@ def issueShowHandler (p : Parsed) : IO UInt32 := do
       IO.println "Children:"
       for c in children do
         IO.println s!"  - {c.id.value}  {issueStatusToString c.status}  {c.title}"
+    let allTasks ← TaskStore.loadAllTasks
+    let issueTasks := allTasks.filter (·.issueId == some i.id)
+      |>.toList.mergeSort (·.createdAt < ·.createdAt) |>.toArray
+    if issueTasks.isEmpty then
+      IO.println "Tasks:        -"
+    else
+      IO.println "Tasks:"
+      for t in issueTasks do
+        let role := t.role.map (s!" ({·})") |>.getD ""
+        IO.println s!"  - {t.createdAt}  {repr t.status}  {t.id}{role}"
     IO.println "Description:"
     for line in i.description.splitOn "\n" do
       IO.println s!"  {line}"
@@ -468,6 +548,22 @@ private def projectShowCmd : Cmd := `[Cli|
     "id" : String; "Project ID"
 ]
 
+private def projectHealthCmd : Cmd := `[Cli|
+  health VIA projectHealthHandler; ["0.1.0"]
+  "Check health of claimed issues: flag any whose claiming task record is missing."
+
+  ARGS:
+    "id" : String; "Project ID"
+]
+
+private def projectReleaseOrphansCmd : Cmd := `[Cli|
+  releaseOrphans VIA projectReleaseOrphansHandler; ["0.1.0"]
+  "Release all orphaned claimed issues (missing task, not on queue) back to open."
+
+  ARGS:
+    "id" : String; "Project ID"
+]
+
 def projectCmd : Cmd := `[Cli|
   project VIA subcommandDefault; ["0.1.0"]
   "Manage orchestra projects (organizational units grouping issues + tasks)."
@@ -475,7 +571,9 @@ def projectCmd : Cmd := `[Cli|
   SUBCOMMANDS:
     projectCreateCmd;
     projectListCmd;
-    projectShowCmd
+    projectShowCmd;
+    projectHealthCmd;
+    projectReleaseOrphansCmd
 ]
 
 private def issueAddCmd : Cmd := `[Cli|

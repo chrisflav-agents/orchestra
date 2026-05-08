@@ -596,11 +596,20 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         issueNumber      := entry.issueNumber
         projectId        := entry.projectId
         issueId          := entry.issueId
+        role             := entry.role
       }
     }
     let cfg ← match entry.configPath with
       | none    => pure appConfig
       | some cp => loadAppConfig (some (System.FilePath.mk cp))
+    -- If this entry holds a pre-claimed issue, release it back to open on any
+    -- unhandled exception so the issue never gets permanently stuck.
+    let releaseClaimOnError : IO Unit := do
+      match entry.projectId, entry.issueId with
+      | some pid, some iid =>
+        let now ← TaskStore.currentIso8601
+        let _ ← Project.release TaskRunner.globalClaimManager pid iid .open now
+      | _, _ => pure ()
     try
       let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
@@ -634,6 +643,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       else
         IO.eprintln s!"Queue entry {entry.id} failed: {e}"
         try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+        try releaseClaimOnError catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
   -- Load listener configs and spawn one fiber per listener.
   let lDir ← match listenerDir with

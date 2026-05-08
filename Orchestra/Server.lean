@@ -38,6 +38,10 @@ structure State where
   claimManager : Option Project.ClaimManager := none
   /-- Orchestra task ID, recorded as the holder when claims are taken. -/
   taskId : Option String := none
+  /-- Orchestra project this task belongs to. Enables the `project_info` tool. -/
+  projectId : Option Project.ProjectId := none
+  /-- Orchestra issue this task is working on (may be pre-claimed or runtime-claimed). -/
+  issueId : Option Project.IssueId := none
   /-- Backend label of the running agent (e.g. "claude"). Recorded with claims. -/
   agentBackend : String := "unknown"
   /-- Series the task belongs to. Recorded with claims. -/
@@ -253,8 +257,9 @@ private def toolsList (state : State) : Json :=
   let project := Project.Tools.toolDefs.filterMap fun (perm, _name, def_) =>
     if state.allowedTools.contains perm then some def_ else none
   let io := ioToolDefs state.inputType state.outputType
+  let projectInfo := if state.projectId.isSome then #[Project.Tools.projectInfoToolDef] else #[]
   Json.mkObj [("tools",
-    .arr (alwaysAvailableTools ++ optional.toArray ++ project.toArray ++ io))]
+    .arr (alwaysAvailableTools ++ projectInfo ++ optional.toArray ++ project.toArray ++ io))]
 
 -- Types
 
@@ -309,6 +314,7 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
   match name with
   | "health" => .health
   | "refresh_token" => .refreshToken
+  | "project_info" => .project .projectInfo
   | "create_pr" =>
     let title := args.getObjValAs? String "title" |>.toOption |>.getD "Agent PR"
     let body  := args.getObjValAs? String "body"  |>.toOption |>.getD ""
@@ -587,7 +593,9 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       , allowedTools  := state.allowedTools
       , taskId        := state.taskId
       , agentBackend  := state.agentBackend
-      , series          := state.series
+      , series        := state.series
+      , projectId     := state.projectId
+      , issueId       := state.issueId
       , enqueueMerger   := state.enqueueMerger
       , enqueueReviewer := state.enqueueReviewer }
     Project.Tools.evalProjectTool env call

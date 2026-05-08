@@ -251,6 +251,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     backend := ioTask.backend, model := ioTask.model, agent := ioTask.agent
     systemPrompt := ioTask.systemPrompt, budget := ioTask.budget
     priority := ioTask.priority
+    projectId := ioTask.projectId
+    issueId   := ioTask.issueId
+    role      := ioTask.role
   }
   TaskStore.saveTask initialRecord
   -- Resolve initial resume session from the continued task
@@ -339,6 +342,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     taskId := some taskId
     agentBackend := ioTask.backend.getD "claude"
     series
+    projectId := ioTask.projectId
+    issueId   := ioTask.issueId
     enqueueMerger   := some enqueueMergerImpl
     enqueueReviewer := some enqueueReviewerImpl
   }
