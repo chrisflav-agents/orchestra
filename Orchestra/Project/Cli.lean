@@ -3,6 +3,7 @@ import Orchestra.Config
 import Orchestra.Queue
 import Orchestra.DaemonRequest
 import Orchestra.TaskStore
+import Orchestra.Utils.Format
 import Orchestra.Utils.UnixSocket
 import Orchestra.Project.Basic
 import Orchestra.Project.Claim
@@ -26,12 +27,6 @@ Handlers and `Cli.Cmd` definitions live next to the project domain code so
 that `Main.lean` only needs to import this module and reference `projectCmd`
 / `issueCmd` from its top-level subcommand list. -/
 
-/-- Right-pad / truncate `s` to width `n`. Local copy to avoid pulling
-    Main-only helpers across the module boundary. -/
-private def padRight (s : String) (n : Nat) : String :=
-  let truncated := String.ofList (s.toList.take n)
-  truncated ++ String.ofList (List.replicate (n - truncated.length) ' ')
-
 private def parseRepoFlag? (p : Parsed) : Except String (Option Repository) := do
   match p.flag? "default-repo" |>.map (·.as! String) with
   | none   => return none
@@ -54,6 +49,7 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "completed" => some .completed
   | "blocked"   => some .blocked
   | "abandoned" => some .abandoned
+  | "rejected"  => some .rejected
   | _           => none
 
 private def issueStatusToString : IssueStatus → String

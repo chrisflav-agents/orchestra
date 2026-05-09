@@ -232,6 +232,7 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "blocked"   => some .blocked
   | "completed" => some .completed
   | "abandoned" => some .abandoned
+  | "rejected"  => some .rejected
   | _           => none
 
 private def parseTarget? (args : Json) : Except String (Option RepoTarget) := do
@@ -531,34 +532,46 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     | none => return content s!"issue {iid.value} not found" (isError := true)
     | some (project, i) =>
       IO.println s!"  [mcp] release_claim: {iid.value} \"{i.title}\" — {reason}"
-      let _ ← release mgr project.id iid .open now
+      let newStatus := if i.status == .blocked then .blocked else .open
+      let _ ← release mgr project.id iid newStatus now
       return content s!"released claim on {iid.value} ({reason})"
   | .attachPr iid repo number branch =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)
+    let some taskId := env.taskId
+      | return content "no task id in context (cannot verify claim ownership)" (isError := true)
     match ← findIssue iid with
     | none => return content s!"issue {iid.value} not found" (isError := true)
     | some (project, i) =>
-      IO.println s!"  [mcp] attach_pr: {iid.value} \"{i.title}\" ← {repo}#{number} (branch {branch})"
-      let pr : PRRef := { repo, number, branch, taskId := env.taskId }
-      let updated : Issue :=
-        { i with
-          attachedPRs := i.attachedPRs.push pr
-          status      := .inReview
-          updatedAt   := now }
-      saveIssue updated
-      -- F1: if the project configures an auto-reviewer, enqueue it now.
-      let reviewerNote ← match project.reviewer, env.enqueueReviewer with
-        | some tmpl, some hook =>
-          match ← hook project iid pr tmpl with
-          | .ok rid    =>
-            IO.println s!"  [mcp] attach_pr: reviewer task {rid} enqueued"
-            pure s!"; reviewer task {rid} enqueued"
-          | .error msg =>
-            IO.println s!"  [mcp] attach_pr: reviewer enqueue failed — {msg}"
-            pure s!"; reviewer enqueue failed: {msg}"
-        | _, _ => pure ""
-      return content
-        s!"attached {repo}#{number} to {iid.value}; issue moved to in_review{reviewerNote}"
+      match ← loadClaim project.id iid with
+      | none =>
+        return content s!"cannot attach PR to {iid.value}: issue is not claimed" (isError := true)
+      | some claim =>
+        if claim.taskId != taskId then
+          return content
+            s!"cannot attach PR to {iid.value}: held by task {claim.taskId}, not this task"
+            (isError := true)
+        else
+          IO.println s!"  [mcp] attach_pr: {iid.value} \"{i.title}\" ← {repo}#{number} (branch {branch})"
+          let pr : PRRef := { repo, number, branch, taskId := env.taskId }
+          let updated : Issue :=
+            { i with
+              attachedPRs := i.attachedPRs.push pr
+              status      := .inReview
+              updatedAt   := now }
+          saveIssue updated
+          -- F1: if the project configures an auto-reviewer, enqueue it now.
+          let reviewerNote ← match project.reviewer, env.enqueueReviewer with
+            | some tmpl, some hook =>
+              match ← hook project iid pr tmpl with
+              | .ok rid    =>
+                IO.println s!"  [mcp] attach_pr: reviewer task {rid} enqueued"
+                pure s!"; reviewer task {rid} enqueued"
+              | .error msg =>
+                IO.println s!"  [mcp] attach_pr: reviewer enqueue failed — {msg}"
+                pure s!"; reviewer enqueue failed: {msg}"
+            | _, _ => pure ""
+          return content
+            s!"attached {repo}#{number} to {iid.value}; issue moved to in_review{reviewerNote}"
   | .splitIssue parentId children reason =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)
     let some mgr := env.claimManager

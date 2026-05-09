@@ -469,9 +469,6 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       let succeeded := finalStatus matches .completed
       if succeeded && issue.status == .inReview then
         let _ ← Project.forceRelease globalClaimManager project.id iid
-      else if succeeded then
-        -- Worker reported success but never attached a PR — release back to open.
-        let _ ← Project.release globalClaimManager project.id iid .open now
       else
         let _ ← Project.release globalClaimManager project.id iid .open now
     | none => pure ()

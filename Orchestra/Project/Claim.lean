@@ -75,10 +75,14 @@ def loadClaim (pid : ProjectId) (iid : IssueId) : IO (Option Claim) := do
   if !(← path.pathExists) then return none
   let contents ← IO.FS.readFile path
   match Json.parse contents with
-  | .error _ => return none
+  | .error e =>
+    IO.eprintln s!"[warn] failed to parse claim file {path}: {e}"
+    return none
   | .ok j    =>
     match FromJson.fromJson? j with
-    | .error _ => return none
+    | .error e =>
+      IO.eprintln s!"[warn] failed to parse claim file {path}: {e}"
+      return none
     | .ok c    => return some c
 
 /-- All claims currently held within a project. -/
@@ -120,10 +124,10 @@ def tryClaim (mgr : ClaimManager) (pid : ProjectId) (iid : IssueId)
   try
     let some issue ← loadIssue pid iid
       | return .invalid s!"issue {iid.value} not found"
-    if let some existing ← loadClaim pid iid then
-      return .alreadyClaimed existing
     if issue.status != .open then
       return .invalid s!"issue {iid.value} is not open (status={repr issue.status})"
+    if let some existing ← loadClaim pid iid then
+      return .alreadyClaimed existing
     let claim : Claim := { taskId, agent, series, claimedAt := nowIso }
     writeClaim pid iid claim
     saveIssue { issue with status := .claimed, updatedAt := nowIso }

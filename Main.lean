@@ -15,10 +15,6 @@ private def parseFloat? (s : String) : Option Float :=
   | .ok (.num n) => some n.toFloat
   | _ => none
 
-private def padRight (s : String) (n : Nat) : String :=
-  let truncated := String.ofList (s.toList.take n)
-  truncated ++ String.ofList (List.replicate (n - truncated.length) ' ')
-
 private def stripExt (s ext : String) : String :=
   if s.endsWith ext then
     s.dropEnd ext.length |>.toString

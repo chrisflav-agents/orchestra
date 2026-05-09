@@ -275,10 +275,14 @@ def loadProject (pid : ProjectId) : IO (Option Project) := do
   if !(← path.pathExists) then return none
   let contents ← IO.FS.readFile path
   match Json.parse contents with
-  | .error _ => return none
+  | .error e =>
+    IO.eprintln s!"[warn] failed to parse project file {path}: {e}"
+    return none
   | .ok j    =>
     match FromJson.fromJson? j with
-    | .error _ => return none
+    | .error e =>
+      IO.eprintln s!"[warn] failed to parse project file {path}: {e}"
+      return none
     | .ok p    => return some p
 
 private def stripJsonExt (name : String) : Option String :=
@@ -306,10 +310,14 @@ def loadIssue (pid : ProjectId) (iid : IssueId) : IO (Option Issue) := do
   if !(← path.pathExists) then return none
   let contents ← IO.FS.readFile path
   match Json.parse contents with
-  | .error _ => return none
+  | .error e =>
+    IO.eprintln s!"[warn] failed to parse issue file {path}: {e}"
+    return none
   | .ok j    =>
     match FromJson.fromJson? j with
-    | .error _ => return none
+    | .error e =>
+      IO.eprintln s!"[warn] failed to parse issue file {path}: {e}"
+      return none
     | .ok r    => return some r
 
 /-- All issues belonging to a project. -/
