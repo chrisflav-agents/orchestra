@@ -159,6 +159,18 @@ def release (mgr : ClaimManager) (pid : ProjectId) (iid : IssueId)
   finally
     mgr.mutex.unlock
 
+/-- Retag an existing claim with a new task ID. Called when a pre-claimed issue
+    is picked up by a freshly-generated session: the claim was written with the
+    queue-entry ID, but the running task has a different generated ID. -/
+def updateClaimTaskId (mgr : ClaimManager) (pid : ProjectId) (iid : IssueId)
+    (newTaskId : String) : IO Unit := do
+  mgr.mutex.lock
+  try
+    if let some claim ← loadClaim pid iid then
+      writeClaim pid iid { claim with taskId := newTaskId }
+  finally
+    mgr.mutex.unlock
+
 /-- Force-release without changing the issue status. Useful for daemon
     shutdown / orphan cleanup where we don't want to overwrite the current
     issue state. -/

@@ -252,6 +252,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (interactive : Bool := true) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
   IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
+  -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
+  -- one ID at enqueue time and the task gets a second ID here at run time,
+  -- requiring the pre-claim retag in `updateClaimTaskId`. The fix is to
+  -- pre-assign the task ID on the queue entry and pass it in instead of
+  -- generating a new one, making `entry.taskId : Option String` redundant.
   let taskId ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
   let initialRecord : TaskStore.TaskRecord := {
@@ -266,6 +271,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     role      := ioTask.role
   }
   TaskStore.saveTask initialRecord
+  -- If this task was pre-claimed (daemon wrote the claim with the queue-entry
+  -- ID before we ran), retag the claim with the real generated taskId so that
+  -- ownership checks in attach_pr / split_issue pass.
+  if let (some pid, some iid) := (ioTask.projectId, ioTask.issueId) then
+    Project.updateClaimTaskId globalClaimManager pid iid taskId
   -- Resolve initial resume session from the continued task
   let initialResume : Option String ← match continuesFrom with
     | none => pure none
