@@ -15,10 +15,6 @@ private def parseFloat? (s : String) : Option Float :=
   | .ok (.num n) => some n.toFloat
   | _ => none
 
-private def padRight (s : String) (n : Nat) : String :=
-  let truncated := String.ofList (s.toList.take n)
-  truncated ++ String.ofList (List.replicate (n - truncated.length) ' ')
-
 private def stripExt (s ext : String) : String :=
   if s.endsWith ext then
     s.dropEnd ext.length |>.toString
@@ -217,6 +213,11 @@ private def tagHandler (p : Parsed) : IO UInt32 := do
   TaskStore.updateSeriesPointer seriesName id
   IO.println s!"Task {id} added to series '{seriesName}'"
   return (0 : UInt32)
+
+-- The project / issue subcommands live in `Orchestra.Project.Cli` so the
+-- domain code stays self-contained. We only re-export the top-level cmds
+-- here so the macro that builds `orchestraCmd` can find them by name.
+open Orchestra.Project.Cli (projectCmd issueCmd spawnCmd rolesCmd)
 
 private def resumeHandler (p : Parsed) : IO UInt32 := do
   let seriesName := p.positionalArg! "series" |>.as! String
@@ -464,6 +465,12 @@ private def handleSocketRequest
               token.cancel .cancel
           shutdownToken.cancel .shutdown
           pure DaemonRequest.DaemonResponse.ok
+        | .claimIssue pid iid taskId agent series =>
+          let now ← TaskStore.currentIso8601
+          match ← Project.tryClaim TaskRunner.globalClaimManager pid iid taskId agent now series with
+          | .acquired _            => pure (.withId taskId)
+          | .alreadyClaimed exist  => pure (.error s!"already_claimed by task {exist.taskId}")
+          | .invalid reason        => pure (.error reason)
     conn.sendLine (Lean.ToJson.toJson response).compress
   catch e =>
     IO.eprintln s!"Socket request error: {e}"
@@ -582,12 +589,23 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         tools            := entry.tools
         readOnly         := entry.readOnly
         priority         := entry.priority
-        issueNumber := entry.issueNumber
+        issueNumber      := entry.issueNumber
+        projectId        := entry.projectId
+        issueId          := entry.issueId
+        role             := entry.role
       }
     }
     let cfg ← match entry.configPath with
       | none    => pure appConfig
       | some cp => loadAppConfig (some (System.FilePath.mk cp))
+    -- If this entry holds a pre-claimed issue, release it back to open on any
+    -- unhandled exception so the issue never gets permanently stuck.
+    let releaseClaimOnError : IO Unit := do
+      match entry.projectId, entry.issueId with
+      | some pid, some iid =>
+        let now ← TaskStore.currentIso8601
+        let _ ← Project.release TaskRunner.globalClaimManager pid iid .open now
+      | _, _ => pure ()
     try
       let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
@@ -621,6 +639,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       else
         IO.eprintln s!"Queue entry {entry.id} failed: {e}"
         try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+        try releaseClaimOnError catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
   -- Load listener configs and spawn one fiber per listener.
   let lDir ← match listenerDir with
@@ -638,25 +657,71 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           IO.sleep (lcfg.intervalSeconds * 1000).toUInt32
         firstRun := false
         try
+          -- Re-read the config each tick so config changes take effect live.
+          let liveCfg := (← Listener.loadListenerConfig lcfg.name).getD lcfg
           let state  ← Listener.loadListenerState lcfg.name
-          let events ← Listener.pollSource lcfg.source state appConfig.pat
+          if !state.enabled then pure () else
+          let events ← Listener.pollSource liveCfg.source state appConfig.pat
             appConfig.authorizedUsers
           for (_, vars) in (events : Array (String × List (String × String))) do
-            if let some wfPath := lcfg.action.workflowPath then
+            -- Project-dispatcher source: synthetic events carry only `role_name`
+            -- and (optionally) `issue_id`. Build the queue entry directly from
+            -- the named role template, pre-claiming through the in-process
+            -- ClaimManager when the role wants it.
+            match liveCfg.source with
+            | .projectDispatcher pid _ =>
+              let roleName := vars.find? (·.1 == "role_name") |>.map (·.2) |>.getD ""
+              let issueId := vars.find? (·.1 == "issue_id") |>.map (fun p => (⟨p.2⟩ : Project.IssueId))
+              let some project ← Project.loadProject pid | continue
+              let some role ← Project.loadRole pid roleName | continue
+              let issue? : Option Project.Issue ← match issueId with
+                | none => pure none
+                | some iid => Project.loadIssue pid iid
+              let entryOpt ← Listener.buildRoleEntry project role issue?
+              match entryOpt with
+              | none =>
+                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName}: no effective target"
+              | some entry =>
+                -- Pre-claim if the role wants it and we have an issue.
+                let needsClaim :=
+                  match role.dispatch with
+                  | some d => d.preClaim
+                  | none   => false
+                let claimed ← match needsClaim, issue? with
+                  | true, some i =>
+                    let now ← TaskStore.currentIso8601
+                    let agent := role.backend.getD "claude"
+                    match ← Project.tryClaim TaskRunner.globalClaimManager pid i.id
+                                             entry.id agent now none with
+                    | .acquired _ => pure true
+                    | .alreadyClaimed e =>
+                      IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: \
+                        issue {i.id.value} already claimed by {e.taskId}"
+                      pure false
+                    | .invalid r =>
+                      IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: {r}"
+                      pure false
+                  | _, _ => pure true
+                if claimed then
+                  Queue.saveEntry entry
+                  IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} → {entry.id}"
+              continue
+            | _ => pure ()
+            if let some wfPath := liveCfg.action.workflowPath then
               -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
               let resolvedPath := Listener.renderTemplate wfPath vars
               try
                 let yaml ← IO.FS.readFile resolvedPath
                 match Workflow.WorkflowProgram.parseYaml yaml with
                 | .error e =>
-                  IO.eprintln s!"  Listener '{lcfg.name}': workflow parse error: {e}"
+                  IO.eprintln s!"  Listener '{liveCfg.name}': workflow parse error: {e}"
                 | .ok prog =>
                   let upstreamStr :=
-                    let r := Listener.renderTemplate lcfg.action.upstream vars
+                    let r := Listener.renderTemplate liveCfg.action.upstream vars
                     if r.isEmpty then vars.find? (·.1 == "upstream") |>.map (·.2) |>.getD ""
                     else r
                   let forkStr :=
-                    let r := Listener.renderTemplate lcfg.action.fork vars
+                    let r := Listener.renderTemplate liveCfg.action.fork vars
                     if r.isEmpty then vars.find? (·.1 == "fork") |>.map (·.2) |>.getD ""
                     else r
                   let upstream := Repository.parse upstreamStr |>.toOption
@@ -684,17 +749,20 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                       Queue.saveConcertRun { concertRun with status := .failed, finishedAt := some t }
                   pure ()
               catch e =>
-                IO.eprintln s!"  Listener '{lcfg.name}': failed to load workflow: {e}"
+                IO.eprintln s!"  Listener '{liveCfg.name}': failed to load workflow: {e}"
             else
               -- Single-task mode: enqueue a QueueEntry as before.
-              let qentry ← Listener.buildQueueEntry lcfg.action vars
+              let qentry ← Listener.buildQueueEntry liveCfg.action vars
               Queue.saveEntry qentry
-              IO.println s!"  Listener '{lcfg.name}': queued entry {qentry.id}"
+              IO.println s!"  Listener '{liveCfg.name}': queued entry {qentry.id}"
           let newIds := events.filterMap (fun ev =>
             if (ev.1 : String).isEmpty then none else some ev.1)
+          -- Re-read enabled so a disable issued mid-tick is not overwritten.
+          let currentEnabled := (← Listener.loadListenerState lcfg.name).enabled
           let newState : Listener.ListenerState := {
             lastChecked  := ← TaskStore.currentIso8601
             processedIds := state.processedIds ++ newIds
+            enabled      := currentEnabled
           }
           Listener.saveListenerState lcfg.name newState
         catch e =>
@@ -751,7 +819,7 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
     IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork.toString 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
-private def queueListenersHandler (p : Parsed) : IO UInt32 := do
+private def listenerListHandler (p : Parsed) : IO UInt32 := do
   let listenerDir := p.flag? "listener_dir" |>.map (·.as! String)
   let lDir ← match listenerDir with
     | some d => pure (System.FilePath.mk d)
@@ -760,15 +828,30 @@ private def queueListenersHandler (p : Parsed) : IO UInt32 := do
   if configs.isEmpty then
     IO.println s!"No listeners found in {lDir}"
     return (0 : UInt32)
-  IO.println s!"{padRight "LISTENER" 20} {padRight "INTERVAL" 9} {padRight "LAST CHECKED" 22} PROCESSED"
-  IO.println (String.ofList (List.replicate 70 '-'))
+  IO.println s!"{padRight "LISTENER" 24} {padRight "ON" 4} {padRight "INTERVAL" 9} {padRight "LAST CHECKED" 22} PROCESSED"
+  IO.println (String.ofList (List.replicate 80 '-'))
   for cfg in configs do
     let state ← Listener.loadListenerState cfg.name
     let lastChecked := if state.lastChecked.isEmpty then "never" else state.lastChecked
     let processed   := toString state.processedIds.size ++ " events"
     let interval    := s!"{cfg.intervalSeconds}s"
-    IO.println s!"{padRight cfg.name 20} {padRight interval 9} {padRight lastChecked 22} {processed}"
+    let enabled     := if state.enabled then "yes" else "no"
+    IO.println s!"{padRight cfg.name 24} {padRight enabled 4} {padRight interval 9} {padRight lastChecked 22} {processed}"
   return (0 : UInt32)
+
+private def listenerEnableHandler (p : Parsed) : IO UInt32 := do
+  let name := p.positionalArg! "name" |>.as! String
+  let state ← Listener.loadListenerState name
+  Listener.saveListenerState name { state with enabled := true }
+  IO.println s!"Listener '{name}': enabled (takes effect on next tick)"
+  return 0
+
+private def listenerDisableHandler (p : Parsed) : IO UInt32 := do
+  let name := p.positionalArg! "name" |>.as! String
+  let state ← Listener.loadListenerState name
+  Listener.saveListenerState name { state with enabled := false }
+  IO.println s!"Listener '{name}': disabled (takes effect on next tick)"
+  return 0
 
 private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
   -- Daemon status
@@ -815,14 +898,15 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
     IO.println ""
     IO.println s!"Listeners: {listenerConfigs.size}"
     IO.println ""
-    IO.println s!"{padRight "LISTENER" 20} {padRight "INTERVAL" 9} {padRight "LAST CHECKED" 22} QUEUED"
-    IO.println (String.ofList (List.replicate 70 '-'))
+    IO.println s!"{padRight "LISTENER" 24} {padRight "ON" 4} {padRight "INTERVAL" 9} {padRight "LAST CHECKED" 22} QUEUED"
+    IO.println (String.ofList (List.replicate 80 '-'))
     for cfg in listenerConfigs do
       let state       ← Listener.loadListenerState cfg.name
       let lastChecked := if state.lastChecked.isEmpty then "never" else state.lastChecked
       let queued      := toString state.processedIds.size ++ " events"
       let interval    := s!"{cfg.intervalSeconds}s"
-      IO.println s!"{padRight cfg.name 20} {padRight interval 9} {padRight lastChecked 22} {queued}"
+      let enabled     := if state.enabled then "yes" else "no"
+      IO.println s!"{padRight cfg.name 24} {padRight enabled 4} {padRight interval 9} {padRight lastChecked 22} {queued}"
   return 0
 
 private def queueShutdownHandler (p : Parsed) : IO UInt32 := do
@@ -1033,12 +1117,42 @@ private def queueRetryCmd : Cmd := `[Cli|
     series : String; "Only retry entries belonging to this series"
 ]
 
-private def queueListenersCmd : Cmd := `[Cli|
-  listeners VIA queueListenersHandler; ["0.1.0"]
-  "List configured listeners and their polling state."
+private def listenerSubDefault (_ : Parsed) : IO UInt32 := do
+  IO.eprintln "Use a subcommand (list, enable, disable). Try '--help'."
+  return 1
+
+private def listenerListCmd : Cmd := `[Cli|
+  list VIA listenerListHandler; ["0.1.0"]
+  "List configured listeners and their state."
 
   FLAGS:
     listener_dir : String; "Directory of listener configs (default: ~/.agent/listeners/)"
+]
+
+private def listenerEnableCmd : Cmd := `[Cli|
+  enable VIA listenerEnableHandler; ["0.1.0"]
+  "Enable a listener by name (takes effect on next tick)."
+
+  ARGS:
+    "name" : String; "Listener name"
+]
+
+private def listenerDisableCmd : Cmd := `[Cli|
+  disable VIA listenerDisableHandler; ["0.1.0"]
+  "Disable a listener by name (takes effect on next tick)."
+
+  ARGS:
+    "name" : String; "Listener name"
+]
+
+private def listenerCmd : Cmd := `[Cli|
+  listener VIA listenerSubDefault; ["0.1.0"]
+  "Manage listeners (list, enable, disable)."
+
+  SUBCOMMANDS:
+    listenerListCmd;
+    listenerEnableCmd;
+    listenerDisableCmd
 ]
 
 private def queueCmd : Cmd := `[Cli|
@@ -1054,8 +1168,7 @@ private def queueCmd : Cmd := `[Cli|
     queueStatusCmd;
     queueShutdownCmd;
     queueCancelCmd;
-    queueRetryCmd;
-    queueListenersCmd
+    queueRetryCmd
 ]
 
 private def defaultHandler (_ : Parsed) : IO UInt32 := do
@@ -1076,7 +1189,12 @@ def orchestraCmd : Cmd := `[Cli|
     seriesCmd;
     tagCmd;
     resumeCmd;
-    queueCmd
+    queueCmd;
+    listenerCmd;
+    projectCmd;
+    issueCmd;
+    spawnCmd;
+    rolesCmd
 ]
 
 def main (args : List String) : IO UInt32 := do

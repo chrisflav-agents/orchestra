@@ -3,6 +3,7 @@ import Std.Internal.UV.TCP
 import Std.Net
 import Orchestra.Config
 import Orchestra.GitHub
+import Orchestra.Project.Tools
 
 open Lean (Json)
 open Std.Net
@@ -32,6 +33,26 @@ structure State where
   outputRef : Option (IO.Ref (Option Json)) := none
   /-- Issue or PR number this task was launched from. Required for the `comment` tool. -/
   issueNumber : Option Nat := none
+  /-- Claim manager handle. Required for `claim_issue` / `release_claim` /
+      `decide_issue reject`. `none` outside the daemon. -/
+  claimManager : Option Project.ClaimManager := none
+  /-- Orchestra task ID, recorded as the holder when claims are taken. -/
+  taskId : Option String := none
+  /-- Orchestra project this task belongs to. Enables the `project_info` tool. -/
+  projectId : Option Project.ProjectId := none
+  /-- Orchestra issue this task is working on (may be pre-claimed or runtime-claimed). -/
+  issueId : Option Project.IssueId := none
+  /-- Backend label of the running agent (e.g. "claude"). Recorded with claims. -/
+  agentBackend : String := "unknown"
+  /-- Series the task belongs to. Recorded with claims. -/
+  series : Option String := none
+  /-- Hook that enqueues a merger task, set by the daemon. Plumbed by
+      `Project.Tools.Env` so `decide_issue approve` can request a merge. -/
+  enqueueMerger : Option (Project.ProjectId → Project.IssueId → Project.PRRef →
+                          IO (Except String String)) := none
+  /-- Optional auto-reviewer hook (F1). Plumbed to `Project.Tools.Env.enqueueReviewer`. -/
+  enqueueReviewer : Option (Project.Project → Project.IssueId → Project.PRRef →
+                            Project.ReviewerTemplate → IO (Except String String)) := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -101,7 +122,12 @@ private def alwaysAvailableTools : Array Json := #[
 private def optionalToolDefs : List (String × Json) := [
   ("create_pr", Json.mkObj [
     ("name", "create_pr"),
-    ("description", "Create a pull request on the upstream repository."),
+    ("description",
+      "Create a pull request. By default the PR is opened on the upstream " ++
+      "repository (cross-repo, head=fork-owner:branch, authenticated by the " ++
+      "configured PAT). Set target=\"fork\" to open the PR on the fork " ++
+      "repository instead — same-repo head, authenticated by a freshly-minted " ++
+      "GitHub App installation token, no PAT required."),
     ("inputSchema", Json.mkObj [
       ("type", "object"),
       ("properties", Json.mkObj [
@@ -111,7 +137,15 @@ private def optionalToolDefs : List (String × Json) := [
           ("type", "string"),
           ("description", "Branch name in the fork.")
         ]),
-        ("base", Json.mkObj [("type", "string")])
+        ("base", Json.mkObj [("type", "string")]),
+        ("target", Json.mkObj [
+          ("type", "string"),
+          ("enum", Json.arr #["upstream", "fork"]),
+          ("description",
+            "Where to open the PR. \"upstream\" (default) targets " ++
+            "state.upstream via PAT; \"fork\" targets state.fork via the " ++
+            "GitHub App installation token.")
+        ])
       ]),
       ("required", .arr #["head"])
     ])
@@ -220,10 +254,24 @@ Call this tool exactly once when the task is complete."),
 private def toolsList (state : State) : Json :=
   let optional := optionalToolDefs.filterMap fun entry =>
     if state.allowedTools.contains entry.1 then some entry.2 else none
+  let project := Project.Tools.toolDefs.filterMap fun (perm, _name, def_) =>
+    if state.allowedTools.contains perm then some def_ else none
   let io := ioToolDefs state.inputType state.outputType
-  Json.mkObj [("tools", .arr (alwaysAvailableTools ++ optional.toArray ++ io))]
+  let projectInfo := if state.projectId.isSome then #[Project.Tools.projectInfoToolDef] else #[]
+  Json.mkObj [("tools",
+    .arr (alwaysAvailableTools ++ projectInfo ++ optional.toArray ++ project.toArray ++ io))]
 
 -- Types
+
+/-- Where a `create_pr` call should open its PR. -/
+inductive PrTarget where
+  /-- Cross-repo PR: head=`fork.owner:branch`, against `state.upstream`. PAT-auth.
+      This is the default and the original behaviour. -/
+  | upstream
+  /-- Same-repo PR: head=bare branch, against `state.fork`. Authenticated by a
+      freshly-minted GitHub App installation token, no PAT required. -/
+  | fork
+deriving Repr, Inhabited
 
 /-- The action performed by the `comment` tool. -/
 inductive CommentAction where
@@ -240,11 +288,15 @@ inductive CommentAction where
 inductive ToolCall where
   | health
   | refreshToken
+  /-- Where a `create_pr` call should open its PR. -/
   | createPr (title : String) (body : String) (head : String) (base : String)
+             (target : PrTarget)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
   | comment (action : CommentAction)
   | getTaskInput
   | submitTaskOutput (value : Json)
+  /-- A project / issue tool from `Orchestra.Project.Tools`. -/
+  | project (call : Project.Tools.ProjectTool)
   | unknown (name : String)
   | parseError (msg : String)
 
@@ -262,13 +314,23 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
   match name with
   | "health" => .health
   | "refresh_token" => .refreshToken
+  | "project_info" => .project .projectInfo
   | "create_pr" =>
     let title := args.getObjValAs? String "title" |>.toOption |>.getD "Agent PR"
     let body  := args.getObjValAs? String "body"  |>.toOption |>.getD ""
     let head  := args.getObjValAs? String "head"  |>.toOption |>.getD ""
     let base  := args.getObjValAs? String "base"  |>.toOption |>.getD "main"
-    if head.isEmpty then .parseError "missing 'head' (branch name)"
-    else .createPr title body head base
+    let targetStr := args.getObjValAs? String "target" |>.toOption |>.getD "upstream"
+    let target? : Option PrTarget := match targetStr with
+      | "upstream" => some .upstream
+      | "fork"     => some .fork
+      | _          => none
+    match target? with
+    | none =>
+      .parseError s!"invalid 'target' (expected \"upstream\" or \"fork\", got {repr targetStr})"
+    | some target =>
+      if head.isEmpty then .parseError "missing 'head' (branch name)"
+      else .createPr title body head base target
   | "get_pr_comments" =>
     match args.getObjVal? "pr_number" |>.toOption with
     | none => .parseError "missing required argument: pr_number"
@@ -327,7 +389,11 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
     match args.getObjVal? "value" with
     | .ok v  => .submitTaskOutput v
     | .error _ => .parseError "missing required 'value' argument"
-  | _ => .unknown name
+  | _ =>
+    match Project.Tools.tryParseToolCall name args with
+    | some (.ok call) => .project call
+    | some (.error e) => .parseError e
+    | none            => .unknown name
 
 /-- Parse a JSON-RPC message into a typed `Request`.
     Returns `none` if the message has no method field. -/
@@ -364,22 +430,40 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     catch e =>
       log s!"tool refresh_token: error: {e}"
       return toolContent (toString e) (isError := true)
-  | .createPr title body head base =>
+  | .createPr title body head base target =>
     if !state.allowedTools.contains "create_pr" then
       log "tool create_pr: denied (not in allowed tools)"
       return toolContent "PR creation is not enabled for this task" (isError := true)
-    if state.pat.isEmpty then
-      log "tool create_pr: error: PAT not configured"
-      return toolContent "github.pat not set in config" (isError := true)
-    log s!"tool create_pr: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
-    try
-      let result ← GitHub.createPullRequest state.pat state.upstream
-        s!"{state.fork.owner}:{head}" base title body
-      log s!"tool create_pr: ok: {result.trimAscii}"
-      return toolContent result
-    catch e =>
-      log s!"tool create_pr: error: {e}"
-      return toolContent (toString e) (isError := true)
+    match target with
+    | .upstream =>
+      if state.pat.isEmpty then
+        log "tool create_pr: error: PAT not configured (target=upstream)"
+        return toolContent
+          "github.pat not set in config (required when target=upstream; pass target=\"fork\" to use the App token)"
+          (isError := true)
+      log s!"tool create_pr [upstream]: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
+      try
+        let result ← GitHub.createPullRequest state.pat state.upstream
+          s!"{state.fork.owner}:{head}" base title body
+        log s!"tool create_pr: ok: {result.trimAscii}"
+        return toolContent result
+      catch e =>
+        log s!"tool create_pr: error: {e}"
+        return toolContent (toString e) (isError := true)
+    | .fork =>
+      log s!"tool create_pr [fork]: {state.fork}:{head} base={base} title={repr title}"
+      try
+        -- Mint a fresh installation token so the PR is attributed to the
+        -- GitHub App, not the PAT owner.
+        let jwt ← GitHub.createJWT state.appId state.privateKeyPath
+        let token ← GitHub.createInstallationToken jwt state.installationId
+        let result ← GitHub.createPullRequestOnRepo token state.fork
+          head base title body
+        log s!"tool create_pr: ok: {result.trimAscii}"
+        return toolContent result
+      catch e =>
+        log s!"tool create_pr: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .getPrComments prNumber unresolvedOnly excludeOutdated =>
     log s!"tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
       exclude_outdated={excludeOutdated}"
@@ -457,6 +541,18 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       return toolContent "output recorded"
     | none =>
       return toolContent "output submission not available for this task" (isError := true)
+  | .project call =>
+    let env : Project.Tools.Env :=
+      { claimManager  := state.claimManager
+      , allowedTools  := state.allowedTools
+      , taskId        := state.taskId
+      , agentBackend  := state.agentBackend
+      , series        := state.series
+      , projectId     := state.projectId
+      , issueId       := state.issueId
+      , enqueueMerger   := state.enqueueMerger
+      , enqueueReviewer := state.enqueueReviewer }
+    Project.Tools.evalProjectTool env call
   | .unknown name =>
     log s!"tool {name}: unknown"
     return toolContent s!"unknown tool: {name}" (isError := true)

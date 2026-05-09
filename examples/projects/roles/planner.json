@@ -1,0 +1,14 @@
+{
+  "name": "planner",
+  "permissions": ["manage_issues", "comment"],
+  "backend": "claude",
+  "model": "sonnet",
+  "system_prompt": "plan-agent",
+  "read_only": true,
+  "priority": 20,
+  "prompt_template": "Plan more work for project {{project_name}} (id: {{project_id}}).\n\nNothing is currently in flight. Inspect the project's existing issues with list_issues, then create new sub-issues with create_issue or add structure with parent_id.\n\n{{instructions}}",
+  "dispatch": {
+    "trigger": "idle",
+    "max": 0
+  }
+}

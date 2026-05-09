@@ -2,6 +2,7 @@ import Lean.Data.Json
 import Orchestra.Config
 import Orchestra.TaskStore
 import Orchestra.Queue
+import Orchestra.Project
 
 open Lean (Json FromJson ToJson)
 
@@ -43,7 +44,12 @@ inductive SourceConfig where
       Only users in `authorizedUsers` may trigger (empty = allow all). -/
   | githubComments  (repos : List RepoEntry) (labels : List String) (trigger : String)
                     (authorizedUsers : List String)
-  | shell           (command : String) (args : List String)
+  | shell             (command : String) (args : List String)
+  /-- Auto-dispatch project work using role templates.
+      `caps` maps role name → maximum concurrent active tasks of that role.
+      Each tick the dispatcher counts active per-role queue entries and emits
+      a synthetic event per role that is below its cap and whose trigger holds. -/
+  | projectDispatcher (projectId : Project.ProjectId) (caps : List (String × Nat))
 
 instance : ToJson SourceConfig where
   toJson
@@ -68,6 +74,11 @@ instance : ToJson SourceConfig where
     | .shell cmd args =>
         Json.mkObj [("type", "shell"), ("command", cmd),
                     ("args", ToJson.toJson args)]
+    | .projectDispatcher pid caps =>
+        Json.mkObj [("type", "project-dispatcher"),
+                    ("project_id", Json.str pid.value),
+                    ("caps", Json.mkObj
+                       (caps.map (fun (n, c) => (n, Json.num c))))]
 
 /-- Parse a `repos` list from JSON.  If `"repos"` is absent, fall back to the singular
     `"fork"` string (treated as both `upstream` and `fork`). -/
@@ -105,6 +116,13 @@ instance : FromJson SourceConfig where
         let cmd  ← j.getObjValAs? String "command"
         let args  := j.getObjValAs? (List String) "args" |>.toOption |>.getD []
         return .shell cmd args
+    | "project-dispatcher" =>
+        let pid  ← j.getObjValAs? String "project_id"
+        let capsObj := j.getObjVal? "caps" |>.toOption |>.getD (Json.mkObj [])
+        let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
+        let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
+          v.getNat?.toOption.map (k, ·)
+        return .projectDispatcher ⟨pid⟩ caps
     | _ => .error s!"unknown source type: {ty}"
 
 -- Action template
@@ -228,18 +246,23 @@ instance : FromJson ListenerConfig where
 structure ListenerState where
   lastChecked  : String       -- ISO 8601 UTC, empty = never
   processedIds : Array String -- source-specific event IDs already queued
+  /-- When false the daemon skips this listener each tick. Toggled via
+      `orchestra listener enable/disable` without editing config files. -/
+  enabled      : Bool := true
 
 instance : ToJson ListenerState where
   toJson s := Json.mkObj [
     ("last_checked",   s.lastChecked),
-    ("processed_ids",  ToJson.toJson s.processedIds)
+    ("processed_ids",  ToJson.toJson s.processedIds),
+    ("enabled",        Json.bool s.enabled)
   ]
 
 instance : FromJson ListenerState where
   fromJson? j := do
     let lastChecked  ← j.getObjValAs? String "last_checked"
     let processedIds  := j.getObjValAs? (Array String) "processed_ids" |>.toOption |>.getD #[]
-    return { lastChecked, processedIds }
+    let enabled       := j.getObjValAs? Bool "enabled" |>.toOption |>.getD true
+    return { lastChecked, processedIds, enabled }
 
 -- Directories
 
@@ -263,6 +286,7 @@ def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
     match FromJson.fromJson? j with
     | .error _ => return none
     | .ok cfg  => return some cfg
+
 
 def loadAllListenerConfigs (dir : System.FilePath) : IO (Array ListenerConfig) := do
   if !(← dir.pathExists) then return #[]
@@ -395,6 +419,92 @@ private def effectiveAllowed (sourceUsers globalUsers : List String) : List Stri
     An empty list means "allow everyone". -/
 private def isAuthorized (allowed : List String) (author : String) : Bool :=
   allowed.isEmpty || allowed.contains author
+
+-- Dispatcher decision (pure on its inputs, so it's easy to test).
+
+/-- Inputs to one tick of the project-dispatcher: the active per-role tally
+    that the daemon already keeps, the project's current issues, and the
+    user-configured caps. Outputs the role spawns (≤1 per role per tick) the
+    dispatcher wants to enqueue. -/
+structure DispatcherInput where
+  /-- Currently active queue entries (status pending|running) for this project,
+      grouped by role name. Only roles that appear in `caps` need to be counted. -/
+  activeByRole : Std.HashMap String Nat := {}
+  /-- Issues for the project. Used to evaluate role triggers. -/
+  issues       : Array Project.Issue
+  /-- Caps from the listener config: role name → maximum concurrent. -/
+  caps         : List (String × Nat)
+  /-- Roles available for this project (project files override globals).
+      Roles without a `dispatch` policy are skipped. -/
+  roles        : Array Project.Role
+
+/-- A single role to spawn this tick. `issueId` is set when the role's
+    trigger is `hasOpenIssues` and we picked a specific issue to bind to. -/
+structure RoleSpawn where
+  roleName : String
+  issueId  : Option Project.IssueId := none
+deriving Repr, Inhabited
+
+/-- Pure decision logic. Spawns at most one of each role per tick to avoid
+    bursts; if you want N at once across consecutive ticks, set the cap and
+    the dispatcher will fill up gradually. -/
+def dispatcherTick (input : DispatcherInput) : Array RoleSpawn := Id.run do
+  let mut spawns : Array RoleSpawn := #[]
+  for (roleName, cap) in input.caps do
+    if cap == 0 then continue
+    let active := input.activeByRole.getD roleName 0
+    if active >= cap then continue
+    let some role := input.roles.find? (·.name == roleName) | continue
+    let some dispatch := role.dispatch | continue
+    match dispatch.trigger with
+    | .hasOpenIssues =>
+      -- Pick the first open issue not already in `spawns` (so we don't try
+      -- to spawn two workers for the same issue in one tick).
+      let alreadyTargeted : Array String := spawns.filterMap fun s => s.issueId.map (·.value)
+      let some issue := input.issues.find? (fun i =>
+        i.status == .open && !alreadyTargeted.contains i.id.value)
+        | continue
+      spawns := spawns.push { roleName, issueId := some issue.id }
+    | .hasInReviewIssues =>
+      if input.issues.any (·.status == .inReview) then
+        spawns := spawns.push { roleName }
+    | .idle =>
+      let hasOpen     := input.issues.any (·.status == .open)
+      let hasInReview := input.issues.any (·.status == .inReview)
+      if !hasOpen && !hasInReview then
+        spawns := spawns.push { roleName }
+  return spawns
+
+/-- Build a queue entry for a role spawn. Returns `none` if the role refers
+    to a missing target (multi-org project where neither the role's bound
+    issue nor the project default sets one). -/
+def buildRoleEntry (project : Project.Project) (role : Project.Role)
+    (issue? : Option Project.Issue) (instructions : String := "") :
+    IO (Option Queue.QueueEntry) := do
+  let target := issue?.bind (Project.effectiveTarget project ·)
+            <|> project.defaultTarget
+  let some target' := target | return none
+  let id ← TaskStore.generateId
+  let createdAt ← TaskStore.currentIso8601
+  let vars   := Project.renderVarsFor project issue? instructions
+  let prompt := Project.render role.promptTemplate vars
+  return some
+    { id, createdAt
+    , upstream      := target'.repo
+    , fork          := target'.repo
+    , mode          := .pr
+    , prompt
+    , backend       := role.backend
+    , model         := role.model
+    , systemPrompt  := role.systemPrompt
+    , prependPrompt := role.prependPrompt
+    , budget        := role.budget
+    , priority      := role.priority
+    , readOnly      := role.readOnly
+    , tools         := some role.permissions
+    , projectId     := some project.id
+    , issueId       := issue?.map (·.id)
+    , role          := some role.name }
 
 -- Source polling
 
@@ -622,5 +732,29 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let trimmed := out.trimAscii.toString
     if trimmed.isEmpty then return #[]
     return #[("", [("output", trimmed)])]
+
+  | .projectDispatcher pid caps => do
+    let some _project ← Project.loadProject pid
+      | IO.eprintln s!"[dispatcher] project {pid.value} not found; skipping"; return #[]
+    let issues ← Project.loadIssues pid
+    let roles  ← Project.loadAllRoles pid
+    -- Count active per-role queue entries scoped to this project.
+    let allEntries ← Queue.loadAllEntries
+    let mut active : Std.HashMap String Nat := {}
+    for e in allEntries do
+      let isActive := e.status == .pending || e.status == .running
+      if !isActive then continue
+      if e.projectId != some pid then continue
+      if let some r := e.role then
+        active := active.insert r ((active.getD r 0) + 1)
+    let spawns := dispatcherTick { activeByRole := active, issues, caps, roles }
+    -- Emit synthetic events. eventId is empty so the listener-state dedup
+    -- doesn't accumulate (each tick is fresh; the cap is the dedup mechanism).
+    return spawns.map fun s =>
+      let baseVars : List (String × String) := [("role_name", s.roleName)]
+      let vars := match s.issueId with
+        | some iid => baseVars ++ [("issue_id", iid.value)]
+        | none     => baseVars
+      ("", vars)
 
 end Orchestra.Listener

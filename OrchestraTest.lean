@@ -4,3 +4,7 @@ import OrchestraTest.ListenerConfigTest
 import OrchestraTest.ServerParseTest
 import OrchestraTest.StreamFormatTest
 import OrchestraTest.WorkflowParserTest
+import OrchestraTest.ProjectClaimTest
+import OrchestraTest.ProjectFieldsTest
+import OrchestraTest.ProjectToolsTest
+import OrchestraTest.ProjectRoleTest
