@@ -57,7 +57,7 @@ def parseToolCall_createPr : Test := do
     ("base",  .str "develop")
   ]
   match parseToolCall "create_pr" args with
-  | .createPr title body head base =>
+  | .createPr title body head base .upstream =>
     TestM.assertEqual title "My PR"          (msg := "title")
     TestM.assertEqual body  "PR body"        (msg := "body")
     TestM.assertEqual head  "feature-branch" (msg := "head")
@@ -68,7 +68,7 @@ def parseToolCall_createPr : Test := do
 def parseToolCall_createPr_defaults : Test := do
   let args := Json.mkObj [("head", .str "my-branch")]
   match parseToolCall "create_pr" args with
-  | .createPr title body head base =>
+  | .createPr title body head base .upstream =>
     TestM.assertEqual title "Agent PR"   (msg := "default title")
     TestM.assertEqual body  ""           (msg := "default body")
     TestM.assertEqual head  "my-branch"  (msg := "head")
