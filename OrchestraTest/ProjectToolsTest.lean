@@ -121,7 +121,9 @@ def attachPrMovesToInReview : Test := do
   let (msg, status) ← (withTempHome do
     let project ← setupProject
     let issue ← addOpenIssue project.id
-    let env := baseEnv [workIssuesPerm]
+    let mgr ← ClaimManager.new
+    let env := baseEnv [workIssuesPerm] (mgr := some mgr) (taskId := "T1")
+    let _ ← evalProjectTool env (.claimIssue issue.id)
     let r ← evalProjectTool env
               (.attachPr issue.id { owner := "o", name := "r" } 42 "feature/x")
     let updated ← loadIssue project.id issue.id
@@ -153,12 +155,15 @@ def decideApproveCallsHook : Test := do
   let (msgOk, wasCalled) ← (withTempHome do
     let project ← setupProject
     let issue ← addOpenIssue project.id
+    let mgr ← ClaimManager.new
     let env : Env :=
-      { allowedTools := [workIssuesPerm, reviewIssuesPerm]
+      { claimManager := some mgr
+      , allowedTools := [workIssuesPerm, reviewIssuesPerm]
       , taskId := some "T1"
       , agentBackend := "claude"
       , enqueueMerger := some (fun _ _ _ => do
           calledRef.set true; return .ok "merger-task-id") }
+    let _ ← evalProjectTool env (.claimIssue issue.id)
     let _ ← evalProjectTool env
               (.attachPr issue.id { owner := "o", name := "r" } 9 "br")
     let r ← evalProjectTool env (.decideIssue issue.id .approve "lgtm")

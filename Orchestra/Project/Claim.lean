@@ -124,10 +124,17 @@ def tryClaim (mgr : ClaimManager) (pid : ProjectId) (iid : IssueId)
   try
     let some issue ← loadIssue pid iid
       | return .invalid s!"issue {iid.value} not found"
-    if issue.status != .open then
+    -- For terminal/blocked statuses a stale orphan claim file must not mask the real
+    -- reason the issue is unavailable.  Check status first so callers see .invalid
+    -- rather than .alreadyClaimed for completed/blocked/abandoned/rejected issues.
+    match issue.status with
+    | .completed | .abandoned | .rejected | .blocked =>
       return .invalid s!"issue {iid.value} is not open (status={repr issue.status})"
+    | _ => pure ()
     if let some existing ← loadClaim pid iid then
       return .alreadyClaimed existing
+    if issue.status != .open then
+      return .invalid s!"issue {iid.value} is not open (status={repr issue.status})"
     let claim : Claim := { taskId, agent, series, claimedAt := nowIso }
     writeClaim pid iid claim
     saveIssue { issue with status := .claimed, updatedAt := nowIso }
