@@ -5,6 +5,8 @@ import Orchestra.Monad.TaskStore
 import Orchestra.Monad.Queue
 import Orchestra.Monad.ProjectTool
 import Orchestra.Monad.SubmitOutput
+import Orchestra.Monad.Project
+import Orchestra.Monad.Claim
 
 /-!
 # Orchestra Monadic Interfaces
@@ -24,6 +26,8 @@ side effects.
 | `MonadQueue`        | queue-entry persistence and PID-file management  |
 | `MonadProjectTool`  | MCP project-tool evaluation                      |
 | `MonadSubmitOutput` | recording the agent's task output value          |
+| `MonadProject`      | project and issue record persistence             |
+| `MonadClaim`        | issue claim lock acquire / release               |
 
 Every typeclass ships with an `IO` instance that delegates to the existing
 concrete implementations, preserving all prior behaviour.

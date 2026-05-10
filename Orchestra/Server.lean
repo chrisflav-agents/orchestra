@@ -11,7 +11,8 @@ open Lean (Json)
 open Std.Net
 open Std.Internal.UV.TCP
 open Orchestra (MonadLog MonadGitHubApp MonadGitHub MonadProjectTool MonadSubmitOutput
-  logError createJWT getInstallationId createInstallationToken setupGhAuth
+  MonadProject MonadClaim MonadTaskStore MonadQueue logError
+  createJWT getInstallationId createInstallationToken setupGhAuth
   createPullRequest createPullRequestOnRepo getPrReviewThreads createIssueComment
   replyToPrReviewComment createPrReviewComment createPrReview getPrReviewCommentPrNumber
   submitOutput)
@@ -94,8 +95,50 @@ instance : MonadGitHub DaemonM where
   createPrReview t r n b cs               := liftM (GitHub.createPrReview t r n b cs)
   getPrReviewCommentPrNumber t r n         := liftM (GitHub.getPrReviewCommentPrNumber t r n)
 
+instance : MonadTaskStore DaemonM where
+  saveTask r                  := liftM (TaskStore.saveTask r)
+  loadTask id                 := liftM (TaskStore.loadTask id)
+  loadAllTasks                := liftM TaskStore.loadAllTasks
+  latestInSeries s            := liftM (TaskStore.latestInSeries s)
+  updateSeriesPointer s tid   := liftM (TaskStore.updateSeriesPointer s tid)
+  generateTaskId              := liftM TaskStore.generateId
+  currentIso8601              := liftM TaskStore.currentIso8601
+
+instance : MonadQueue DaemonM where
+  saveEntry e     := liftM (Queue.saveEntry e)
+  loadEntry id    := liftM (Queue.loadEntry id)
+  loadAllEntries  := liftM Queue.loadAllEntries
+  nextPending     := liftM Queue.nextPending
+  writePid pid    := liftM (Queue.writePid pid)
+  readPid         := liftM Queue.readPid
+  deletePid       := liftM Queue.deletePid
+
+instance : MonadProject DaemonM where
+  freshProjectId          := liftM Project.freshProjectId
+  freshIssueId            := liftM Project.freshIssueId
+  saveProject p           := liftM (Project.saveProject p)
+  loadProject pid         := liftM (Project.loadProject pid)
+  loadAllProjects         := liftM Project.loadAllProjects
+  saveIssue i             := liftM (Project.saveIssue i)
+  loadIssue pid iid       := liftM (Project.loadIssue pid iid)
+  loadIssues pid          := liftM (Project.loadIssues pid)
+  findIssue iid           := liftM (Project.findIssue iid)
+  childrenOf pid iid      := liftM (Project.childrenOf pid iid)
+  rootIssues pid          := liftM (Project.rootIssues pid)
+  loadRole pid s          := liftM (Project.loadRole pid s)
+  loadAllRoles pid        := liftM (Project.loadAllRoles pid)
+  roleSearchPaths pid s   := liftM (Project.roleSearchPaths pid s)
+
+instance : MonadClaim DaemonM where
+  loadClaim pid iid                   := liftM (Project.loadClaim pid iid)
+  loadClaims pid                      := liftM (Project.loadClaims pid)
+  tryClaim mgr pid iid tid ag now ser := liftM (Project.tryClaim mgr pid iid tid ag now ser)
+  release mgr pid iid st now          := liftM (Project.release mgr pid iid st now)
+  updateClaimTaskId mgr pid iid tid   := liftM (Project.updateClaimTaskId mgr pid iid tid)
+  forceRelease mgr pid iid            := liftM (Project.forceRelease mgr pid iid)
+
 instance : MonadProjectTool DaemonM where
-  evalProjectTool env call := liftM (Project.Tools.evalProjectTool env call)
+  evalProjectTool env call := Project.Tools.evalProjectTool env call
 
 -- JSON-RPC helpers
 
