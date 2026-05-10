@@ -284,7 +284,7 @@ orchestra queue retry --series my-series
 ## per-repository configuration
 
 A repository can provide a `.orchestra/` directory with optional hooks and a config
-file:
+file (`.agent/` is also supported for backwards compatibility):
 
 - `.orchestra/init.sh` — run once after cloning
 - `.orchestra/before.sh` — run before each agent launch
@@ -369,6 +369,7 @@ See `examples/listeners/` for further listener examples.
 orchestra prepare <upstream> <fork>   # clone the fork and configure remotes
 orchestra cleanup                     # remove all cloned repositories
 orchestra mcp <upstream> <fork>       # start the MCP server standalone
+orchestra migrate                     # migrate config from ~/.agent/ to XDG directories
 ```
 
 ## container
