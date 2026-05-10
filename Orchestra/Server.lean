@@ -415,7 +415,7 @@ def parseRequest (msg : Json) : Option Request :=
 -- Evaluation
 
 private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
-    [MonadLiftT IO m] [MonadExceptOf IO.Error m] (state : State) (call : ToolCall) : m Json := do
+    [MonadLift IO m] [MonadExceptOf IO.Error m] (state : State) (call : ToolCall) : m Json := do
   match call with
   | .health =>
     logError "[mcp] tool health"
@@ -539,7 +539,7 @@ private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub 
     logError s!"[mcp] tool submit_task_output: {value.compress.take 200}"
     match state.outputRef with
     | some ref =>
-      liftM (α := Unit) (m := IO) (ref.set (some value))
+      liftM (ref.set (some value))
       return toolContent "output recorded"
     | none =>
       return toolContent "output submission not available for this task" (isError := true)
@@ -564,7 +564,7 @@ private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub 
 
 /-- Evaluate a parsed JSON-RPC request. Returns `some` response, or `none` for notifications. -/
 private def evalRequest [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
-    [MonadLiftT IO m] [MonadExceptOf IO.Error m] (state : State) (req : Request) : m (Option Json) := do
+    [MonadLift IO m] [MonadExceptOf IO.Error m] (state : State) (req : Request) : m (Option Json) := do
   match req with
   | .initialize id =>
     logError "[mcp] initialize"
