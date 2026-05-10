@@ -6,6 +6,7 @@ import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
 import Orchestra.GitHub
 import Orchestra.Monad
+import Orchestra.Project.Enqueue
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.Sandbox
@@ -24,56 +25,6 @@ namespace Orchestra.TaskRunner
     intra-process claim acquisition; on-disk files survive restarts. -/
 initialize globalClaimManager : Project.ClaimManager ← Project.ClaimManager.new
 
-/-- Enqueue a merger task for `pr` so the queue daemon will merge it later.
-    Used by `decide_issue approve` via the `enqueueMerger` hook. Returns the
-    new queue entry's ID. -/
-def enqueueMergerImpl [Monad m] [MonadTaskStore m] [MonadQueue m]
-    (pid : Project.ProjectId) (iid : Project.IssueId)
-    (pr : Project.PRRef) : m String := do
-  let id ← generateTaskId
-  let createdAt ← currentIso8601
-  let entry : Queue.QueueEntry :=
-    { id, createdAt
-    , upstream := pr.repo, fork := pr.repo
-    , mode := .pr
-    , prompt := s!"merge {pr.repo}#{pr.number}"
-    , backend := some "merger"
-    , projectId := some pid
-    , issueId := some iid
-    , priority := 100 }
-  saveEntry entry
-  return id
-
-/-- Render the reviewer prompt template with the PR / issue context. -/
-private def renderReviewerPrompt (tmpl : String) (pr : Project.PRRef) (iid : Project.IssueId)
-    : String :=
-  tmpl.replace "{{repo}}"      pr.repo.toString
-    |>.replace "{{pr_number}}" (toString pr.number)
-    |>.replace "{{branch}}"    pr.branch
-    |>.replace "{{issue_id}}"  iid.value
-
-/-- Enqueue a reviewer task for `pr` against `tmpl`. Used by `attach_pr` via
-    the `enqueueReviewer` hook when a project has a `reviewer` template. -/
-def enqueueReviewerImpl [Monad m] [MonadTaskStore m] [MonadQueue m]
-    (project : Project.Project) (iid : Project.IssueId)
-    (pr : Project.PRRef) (tmpl : Project.ReviewerTemplate) : m String := do
-  let id ← generateTaskId
-  let createdAt ← currentIso8601
-  let entry : Queue.QueueEntry :=
-    { id, createdAt
-    , upstream := pr.repo, fork := pr.repo
-    , mode := .pr
-    , prompt := renderReviewerPrompt tmpl.promptTemplate pr iid
-    , backend := tmpl.backend
-    , projectId := some project.id
-    , issueId := some iid
-    -- The reviewer needs review tools but should also be able to comment / read PRs.
-    , tools := some ["review_issues", "comment", "get_pr_comments"]
-    , readOnly := true
-    , issueNumber := some pr.number
-    , priority := 50 }
-  saveEntry entry
-  return id
 
 /-- Run a merger task: checkout the PR branch, run the validation script, then
     shell out to `gh pr merge`. If validation fails the issue is marked
@@ -265,12 +216,13 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     issueId   := ioTask.issueId
     role      := ioTask.role
   }
-  saveTask initialRecord
-  -- If this task was pre-claimed (daemon wrote the claim with the queue-entry
-  -- ID before we ran), retag the claim with the real generated taskId so that
-  -- ownership checks in attach_pr / split_issue pass.
-  if let (some pid, some iid) := (ioTask.projectId, ioTask.issueId) then
-    Project.updateClaimTaskId globalClaimManager pid iid taskId
+  if !interactiveAgent then
+    saveTask initialRecord
+    -- If this task was pre-claimed (daemon wrote the claim with the queue-entry
+    -- ID before we ran), retag the claim with the real generated taskId so that
+    -- ownership checks in attach_pr / split_issue pass.
+    if let (some pid, some iid) := (ioTask.projectId, ioTask.issueId) then
+      Project.updateClaimTaskId globalClaimManager pid iid taskId
   -- Resolve initial resume session from the continued task
   let initialResume : Option String ← match continuesFrom with
     | none => pure none
@@ -340,7 +292,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       Use 'tools' instead (e.g. {repr allowedTools}) and optionally 'read_only: true/false'."
   let inputJson := some (ResultType.valueToJson i input)
   let outputRef ← IO.mkRef (none : Option Lean.Json)
-  let serverState : Server.State IO := {
+  let serverState : Server.State := {
     upstream := ioTask.upstream
     fork := ioTask.fork
     allowedTools
@@ -351,7 +303,6 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     inputType := i
     outputType := o
     inputJson
-    submitOutput := some (fun j => outputRef.set (some j))
     issueNumber := ioTask.issueNumber
     claimManager := some globalClaimManager
     taskId := some taskId
@@ -359,10 +310,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     series
     projectId := ioTask.projectId
     issueId   := ioTask.issueId
-    enqueueMerger   := some enqueueMergerImpl
-    enqueueReviewer := some enqueueReviewerImpl
+    canEnqueueMerger   := !interactiveAgent
+    canEnqueueReviewer := !interactiveAgent
   }
-  let (port, shutdown) ← Server.start serverState
+  let (port, shutdown) ← Server.start serverState outputRef
   logInfo s!"  MCP server on port {port}"
   -- 4. Run init hook and load per-repository config
   RepoConfig.runInitIfNeeded repoPath
@@ -388,9 +339,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let mut wasCancelled := false
   let mut lastValidationOutput : String := ""
   let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
-  let maxAttempts := repoConfig.validation.maxRetries + 1
+  let maxAttempts := if interactiveAgent then 1 else repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
-    RepoConfig.runHook repoPath "before.sh"
+    if !interactiveAgent then
+      RepoConfig.runHook repoPath "before.sh"
     let prompt :=
       if attempt == 0 then baseTaskPrompt
       else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
@@ -450,35 +402,37 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     else
       logError s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
   -- 6. Run after hook and shut down MCP server
-  RepoConfig.runHook repoPath "after.sh"
+  if !interactiveAgent then
+    RepoConfig.runHook repoPath "after.sh"
   shutdown
-  -- 7. Persist final task state
-  let finalStatus :=
-    if wasCancelled then .cancelled
-    else match lastResultSubtype with
-      | some .success           => .completed
-      | some .errorMaxBudgetUsd => .unfinished
-      | some (.error _)         => .failed
-      | _                       => if usageLimitHit then .unfinished else .completed
-  saveTask { initialRecord with sessionId, status := finalStatus }
-  -- Release the orchestra-issue claim on terminal status. If the worker
-  -- already moved the issue to .inReview via attach_pr, leave that status
-  -- alone and only delete the lock file (forceRelease). Otherwise hand the
-  -- issue back to the open pool so another worker can pick it up.
-  match ioTask.projectId, ioTask.issueId with
-  | some _pid, some iid =>
-    match ← Project.findIssue iid with
-    | some (project, issue) =>
-      let now ← currentIso8601
-      let succeeded := finalStatus matches .completed
-      if succeeded && issue.status == .inReview then
-        let _ ← Project.forceRelease globalClaimManager project.id iid
-      else
-        let _ ← Project.release globalClaimManager project.id iid .open now
-    | none => pure ()
-  | _, _ => pure ()
-  if let some seriesName := series then
-    updateSeriesPointer seriesName taskId
+  if !interactiveAgent then
+    -- 7. Persist final task state
+    let finalStatus :=
+      if wasCancelled then .cancelled
+      else match lastResultSubtype with
+        | some .success           => .completed
+        | some .errorMaxBudgetUsd => .unfinished
+        | some (.error _)         => .failed
+        | _                       => if usageLimitHit then .unfinished else .completed
+    saveTask { initialRecord with sessionId, status := finalStatus }
+    -- Release the orchestra-issue claim on terminal status. If the worker
+    -- already moved the issue to .inReview via attach_pr, leave that status
+    -- alone and only delete the lock file (forceRelease). Otherwise hand the
+    -- issue back to the open pool so another worker can pick it up.
+    match ioTask.projectId, ioTask.issueId with
+    | some _pid, some iid =>
+      match ← Project.findIssue iid with
+      | some (project, issue) =>
+        let now ← currentIso8601
+        let succeeded := finalStatus matches .completed
+        if succeeded && issue.status == .inReview then
+          let _ ← Project.forceRelease globalClaimManager project.id iid
+        else
+          let _ ← Project.release globalClaimManager project.id iid .open now
+      | none => pure ()
+    | _, _ => pure ()
+    if let some seriesName := series then
+      updateSeriesPointer seriesName taskId
   logInfo s!"=== Task {idx} done ===\n"
   let outputJson ← outputRef.get
   let typedOutput : Option o.Type ← do

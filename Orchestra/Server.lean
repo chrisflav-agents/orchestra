@@ -5,23 +5,21 @@ import Orchestra.Config
 import Orchestra.GitHub
 import Orchestra.Monad
 import Orchestra.Project.Tools
+import Orchestra.Monad.SubmitOutput
 
 open Lean (Json)
 open Std.Net
 open Std.Internal.UV.TCP
-open Orchestra (MonadLog MonadGitHubApp MonadGitHub MonadProjectTool
+open Orchestra (MonadLog MonadGitHubApp MonadGitHub MonadProjectTool MonadSubmitOutput
   logError createJWT getInstallationId createInstallationToken setupGhAuth
   createPullRequest createPullRequestOnRepo getPrReviewThreads createIssueComment
-  replyToPrReviewComment createPrReviewComment createPrReview getPrReviewCommentPrNumber)
+  replyToPrReviewComment createPrReviewComment createPrReview getPrReviewCommentPrNumber
+  submitOutput)
 
 namespace Orchestra.Server
 
-/-- Mutable state for the server, shared with request handlers.
-    Parameterised by the effect monad `m` so that the output-submission
-    callback can be stored as a plain `m`-action rather than a raw
-    `IO.Ref`, avoiding the need for a `MonadLiftT IO m` constraint in
-    the request evaluators. -/
-structure State (m : Type → Type) where
+/-- Immutable configuration for the server, shared with request handlers. -/
+structure State where
   upstream : Repository
   fork : Repository
   /-- Optional tools enabled for this run.
@@ -38,10 +36,6 @@ structure State (m : Type → Type) where
   outputType : ResultType := .unit
   /-- The task input serialized as JSON. `none` when `inputType = .unit`. -/
   inputJson : Option Json := none
-  /-- Action invoked when the agent calls `submit_task_output`.  The caller
-      wires this to whatever storage it needs (e.g. `fun j => ref.set (some j)`);
-      `none` when output submission is not available for this task. -/
-  submitOutput : Option (Json → m Unit) := none
   /-- Issue or PR number this task was launched from. Required for the `comment` tool. -/
   issueNumber : Option Nat := none
   /-- Claim manager handle. Required for `claim_issue` / `release_claim` /
@@ -57,13 +51,51 @@ structure State (m : Type → Type) where
   agentBackend : String := "unknown"
   /-- Series the task belongs to. Recorded with claims. -/
   series : Option String := none
-  /-- Hook that enqueues a merger task, set by the daemon. Plumbed by
-      `Project.Tools.Env` so `decide_issue approve` can request a merge. -/
-  enqueueMerger : Option (Project.ProjectId → Project.IssueId → Project.PRRef →
-                          IO String) := none
-  /-- Optional auto-reviewer hook (F1). Plumbed to `Project.Tools.Env.enqueueReviewer`. -/
-  enqueueReviewer : Option (Project.Project → Project.IssueId → Project.PRRef →
-                            Project.ReviewerTemplate → IO String) := none
+  /-- Whether `decide_issue approve` is permitted to enqueue a merger task. -/
+  canEnqueueMerger : Bool := false
+  /-- Whether `attach_pr` is permitted to enqueue an auto-reviewer task. -/
+  canEnqueueReviewer : Bool := false
+
+-- Daemon monad
+
+/-- Environment threaded through the daemon's request-handling monad.
+    Holds the output ref used by `MonadSubmitOutput`. -/
+structure DaemonEnv where
+  outputRef : IO.Ref (Option Json)
+
+/-- The concrete monad in which the MCP server handles requests.
+    Wraps `IO` in a reader so `MonadSubmitOutput` can write to the output ref
+    without storing a callback in `State`. -/
+abbrev DaemonM := ReaderT DaemonEnv IO
+
+instance : MonadSubmitOutput DaemonM where
+  submitOutput j := do (← read).outputRef.set (some j)
+
+instance : MonadLog DaemonM where
+  logInfo  msg := liftM (IO.println msg)
+  logError msg := liftM (show IO Unit from do
+    let stderr ← IO.getStderr
+    stderr.putStrLn msg
+    stderr.flush)
+
+instance : MonadGitHubApp DaemonM where
+  createJWT appId keyPath             := liftM (GitHub.createJWT appId keyPath)
+  getInstallationId jwt owner         := liftM (GitHub.getInstallationId jwt owner)
+  createInstallationToken jwt instId  := liftM (GitHub.createInstallationToken jwt instId)
+  setupGhAuth token                   := liftM (GitHub.setupGhAuth token)
+
+instance : MonadGitHub DaemonM where
+  createPullRequest t r ti b h bs          := liftM (GitHub.createPullRequest t r ti b h bs)
+  createPullRequestOnRepo t r ti b h bs    := liftM (GitHub.createPullRequestOnRepo t r ti b h bs)
+  getPrReviewThreads r n t                 := liftM (GitHub.getPrReviewThreads r n t)
+  createIssueComment t r n b               := liftM (GitHub.createIssueComment t r n b)
+  replyToPrReviewComment t r n c b         := liftM (GitHub.replyToPrReviewComment t r n c b)
+  createPrReviewComment t r n p f l b      := liftM (GitHub.createPrReviewComment t r n p f l b)
+  createPrReview t r n b cs               := liftM (GitHub.createPrReview t r n b cs)
+  getPrReviewCommentPrNumber t r n         := liftM (GitHub.getPrReviewCommentPrNumber t r n)
+
+instance : MonadProjectTool DaemonM where
+  evalProjectTool env call := liftM (Project.Tools.evalProjectTool env call)
 
 -- JSON-RPC helpers
 
@@ -257,7 +289,7 @@ Call this tool exactly once when the task is complete."),
       ]]
   inputTool ++ outputTool
 
-private def toolsList {m : Type → Type} (state : State m) : Json :=
+private def toolsList (state : State) : Json :=
   let optional := optionalToolDefs.filterMap fun entry =>
     if state.allowedTools.contains entry.1 then some entry.2 else none
   let project := Project.Tools.toolDefs.filterMap fun (perm, _name, def_) =>
@@ -421,7 +453,8 @@ def parseRequest (msg : Json) : Option Request :=
 -- Evaluation
 
 private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
-    [MonadProjectTool m] [MonadExceptOf IO.Error m] (state : State m) (call : ToolCall) : m Json := do
+    [MonadProjectTool m] [MonadExceptOf IO.Error m] [MonadSubmitOutput m]
+    (state : State) (call : ToolCall) : m Json := do
   match call with
   | .health =>
     logError "[mcp] tool health"
@@ -543,23 +576,19 @@ private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub 
     | none   => return toolContent "no input available" (isError := true)
   | .submitTaskOutput value =>
     logError s!"[mcp] tool submit_task_output: {value.compress.take 200}"
-    match state.submitOutput with
-    | some f =>
-      f value
-      return toolContent "output recorded"
-    | none =>
-      return toolContent "output submission not available for this task" (isError := true)
+    submitOutput value
+    return toolContent "output recorded"
   | .project call =>
     let env : Project.Tools.Env :=
-      { claimManager  := state.claimManager
-      , allowedTools  := state.allowedTools
-      , taskId        := state.taskId
-      , agentBackend  := state.agentBackend
-      , series        := state.series
-      , projectId     := state.projectId
-      , issueId       := state.issueId
-      , enqueueMerger   := state.enqueueMerger
-      , enqueueReviewer := state.enqueueReviewer }
+      { claimManager     := state.claimManager
+      , allowedTools     := state.allowedTools
+      , taskId           := state.taskId
+      , agentBackend     := state.agentBackend
+      , series           := state.series
+      , projectId        := state.projectId
+      , issueId          := state.issueId
+      , canEnqueueMerger   := state.canEnqueueMerger
+      , canEnqueueReviewer := state.canEnqueueReviewer }
     MonadProjectTool.evalProjectTool env call
   | .unknown name =>
     logError s!"[mcp] tool {name}: unknown"
@@ -570,7 +599,8 @@ private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub 
 
 /-- Evaluate a parsed JSON-RPC request. Returns `some` response, or `none` for notifications. -/
 private def evalRequest [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
-    [MonadProjectTool m] [MonadExceptOf IO.Error m] (state : State m) (req : Request) : m (Option Json) := do
+    [MonadProjectTool m] [MonadExceptOf IO.Error m] [MonadSubmitOutput m]
+    (state : State) (req : Request) : m (Option Json) := do
   match req with
   | .initialize id =>
     logError "[mcp] initialize"
@@ -602,7 +632,7 @@ Reads newline-delimited JSON messages, dispatches them, and writes responses.
 A line buffer handles the case where a single TCP receive spans multiple messages
 or a message is split across multiple receives.
 -/
-private def handleClient (state : State IO) (client : Socket) : IO Unit := do
+private def handleClient (state : State) (client : Socket) : DaemonM Unit := do
   let buf ← IO.mkRef ""
   repeat do
     let data? ← awaitTcp (← client.recv? 65536)
@@ -628,7 +658,8 @@ private def handleClient (state : State IO) (client : Socket) : IO Unit := do
               let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
 
 /-- Start the MCP server. Returns (port, shutdown action). -/
-def start (state : State IO) : IO (UInt16 × IO Unit) := do
+def start (state : State) (outputRef : IO.Ref (Option Json)) : IO (UInt16 × IO Unit) := do
+  let daemonEnv : DaemonEnv := { outputRef }
   let server ← Socket.new
   let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port := 0 }
   server.bind addr
@@ -645,7 +676,7 @@ def start (state : State IO) : IO (UInt16 × IO Unit) := do
         if !(← running.get) then break
         let _ ← IO.asTask (prio := .dedicated) do
           logError "[mcp] client connected"
-          try handleClient state client
+          try (handleClient state client).run daemonEnv
           catch _ => pure ()
           logError "[mcp] client disconnected"
   let shutdown : IO Unit := do

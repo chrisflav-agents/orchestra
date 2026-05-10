@@ -3,9 +3,11 @@ import Orchestra.Monad.Log
 import Orchestra.Monad.TaskStore
 import Orchestra.Project.Basic
 import Orchestra.Project.Claim
+import Orchestra.Project.Enqueue
 
 open Lean (Json FromJson ToJson)
 open Orchestra (logInfo logError currentIso8601)
+open Orchestra.Project.Enqueue (enqueueMergerImpl enqueueReviewerImpl)
 
 namespace Orchestra.Project.Tools
 
@@ -376,14 +378,10 @@ structure Env where
   agentBackend : String := "unknown"
   /-- Optional series the task belongs to. Stored alongside the claim. -/
   series : Option String := none
-  /-- Hook called by `decideIssue .approve` to enqueue the merger task.
-      Receives (projectId, issueId, prRef). Throws on failure. -/
-  enqueueMerger : Option (ProjectId → IssueId → PRRef → IO String) := none
-  /-- Optional auto-reviewer hook (F1). Called by `attachPr` when the
-      project has a `reviewer` template configured. Receives
-      `(project, issueId, prRef, template)`. Throws on failure. -/
-  enqueueReviewer : Option
-    (Project → IssueId → PRRef → ReviewerTemplate → IO String) := none
+  /-- Whether `decideIssue .approve` is permitted to enqueue a merger task. -/
+  canEnqueueMerger : Bool := false
+  /-- Whether `attachPr` is permitted to enqueue an auto-reviewer task. -/
+  canEnqueueReviewer : Bool := false
   /-- Orchestra project this task belongs to. Used by `project_info`. -/
   projectId : Option ProjectId := none
   /-- Orchestra issue this task is working on. Used by `project_info`. -/
@@ -591,16 +589,18 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
               updatedAt   := now }
           saveIssue updated
           -- F1: if the project configures an auto-reviewer, enqueue it now.
-          let reviewerNote ← match project.reviewer, env.enqueueReviewer with
-            | some tmpl, some hook =>
-              try
-                let rid ← hook project iid pr tmpl
-                logInfo s!"  [mcp] attach_pr: reviewer task {rid} enqueued"
-                pure s!"; reviewer task {rid} enqueued"
-              catch e =>
-                logInfo s!"  [mcp] attach_pr: reviewer enqueue failed — {toString e}"
-                pure s!"; reviewer enqueue failed: {toString e}"
-            | _, _ => pure ""
+          let reviewerNote ← match project.reviewer with
+            | some tmpl =>
+              if env.canEnqueueReviewer then
+                try
+                  let rid ← enqueueReviewerImpl project iid pr tmpl
+                  logInfo s!"  [mcp] attach_pr: reviewer task {rid} enqueued"
+                  pure s!"; reviewer task {rid} enqueued"
+                catch e =>
+                  logInfo s!"  [mcp] attach_pr: reviewer enqueue failed — {toString e}"
+                  pure s!"; reviewer enqueue failed: {toString e}"
+              else pure ""
+            | none => pure ""
           return content
             s!"attached {repo}#{number} to {iid.value}; issue moved to in_review{reviewerNote}"
   | .splitIssue parentId children reason =>
@@ -678,16 +678,14 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         match i.attachedPRs.toList.reverse with
         | [] => return content "no attached PRs to merge" (isError := true)
         | pr :: _ =>
-          match env.enqueueMerger with
-          | none =>
-            return content "merger enqueue hook not configured" (isError := true)
-          | some hook =>
-            try
-              let mergerTaskId ← hook project.id iid pr
-              logInfo s!"  [mcp] decide_issue: {iid.value} approved; merger task {mergerTaskId} enqueued"
-              return content s!"approved {iid.value}; merger task {mergerTaskId} enqueued ({notes})"
-            catch e =>
-              return content s!"failed to enqueue merger: {toString e}" (isError := true)
+          if !env.canEnqueueMerger then
+            return content "merger enqueue not available in this context" (isError := true)
+          try
+            let mergerTaskId ← enqueueMergerImpl project.id iid pr
+            logInfo s!"  [mcp] decide_issue: {iid.value} approved; merger task {mergerTaskId} enqueued"
+            return content s!"approved {iid.value}; merger task {mergerTaskId} enqueued ({notes})"
+          catch e =>
+            return content s!"failed to enqueue merger: {toString e}" (isError := true)
   | .projectInfo =>
     logInfo "  [mcp] project_info"
     match env.projectId with
