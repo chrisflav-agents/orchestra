@@ -35,7 +35,7 @@ The resulting binary is at `.lake/build/bin/orchestra`.
 
 ## configuration
 
-Create `~/.agent/config.json`:
+Create `~/.config/orchestra/config.json`:
 
 ```json
 {
@@ -126,8 +126,8 @@ The legacy flat fields (`claude_token`, `anthropic_api_key`,
 `anthropic_base_url`, `anthropic_auth_token`) still work when no `agents`
 array is present, so existing configurations remain valid.
 
-System prompts can be placed in `~/.agent/prompts/`. The file
-`~/.agent/prompts/default.md` is loaded automatically; named prompts can be
+System prompts can be placed in `~/.config/orchestra/prompts/`. The file
+`~/.config/orchestra/prompts/default.md` is loaded automatically; named prompts can be
 referenced via the `system_prompt` field in a task file.
 
 ## task files
@@ -155,7 +155,7 @@ Fields:
   requests to upstream)
 - `prompt` — instruction sent to the agent
 - `agent` — optional sub-agent name passed to the backend
-- `system_prompt` — optional name of a file in `~/.agent/prompts/` (without
+- `system_prompt` — optional name of a file in `~/.config/orchestra/prompts/` (without
   `.md`); defaults to `default.md` if present
 - `backend` — `"claude"` (default) or `"vibe"`
 - `model` — optional model override passed to the agent
@@ -283,15 +283,15 @@ orchestra queue retry --series my-series
 
 ## per-repository configuration
 
-A repository can provide a `.agent/` directory with optional hooks and a config
+A repository can provide a `.orchestra/` directory with optional hooks and a config
 file:
 
-- `.agent/init.sh` — run once after cloning
-- `.agent/before.sh` — run before each agent launch
-- `.agent/validation.sh` — run after each agent launch; non-zero exit triggers
+- `.orchestra/init.sh` — run once after cloning
+- `.orchestra/before.sh` — run before each agent launch
+- `.orchestra/validation.sh` — run after each agent launch; non-zero exit triggers
   a retry
-- `.agent/after.sh` — run after the validation loop completes
-- `.agent/config.json` — validation settings:
+- `.orchestra/after.sh` — run after the validation loop completes
+- `.orchestra/config.json` — validation settings:
 
 ```json
 {
@@ -305,7 +305,7 @@ file:
 ## listeners
 
 Listeners poll event sources and automatically enqueue tasks. Listener configs
-are JSON files placed in `~/.agent/listeners/`.
+are JSON files placed in `~/.config/orchestra/listeners/`.
 
 Example — respond to issue comments containing a trigger word:
 
