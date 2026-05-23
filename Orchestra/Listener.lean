@@ -57,6 +57,17 @@ inductive SourceConfig where
       `kind` controls what is counted: `"issues"` (default), `"pulls"`, or `"all"`.
       Template variables: `count`, `max`, `needed` (= max − count), `upstream`, `fork`. -/
   | githubLabelCount  (repos : List RepoEntry) (labels : List String) (max : Nat) (kind : String)
+  /-- Fires once for each open issue or pull request that carries at least one of
+      the configured `labels` (empty = any label).  Unlike `githubIssues`, this
+      source covers **both** issues and pull requests.
+      `kind` controls what is matched: `"issues"`, `"pulls"`, or `"all"` (default).
+      Only users in `authorizedUsers` may trigger (empty = allow all).
+      Template variables: `issue_number`, `title`, `body`, `url`, `author`,
+      `labels` (all labels on the item, comma-separated),
+      `matched_labels` (subset that matched the configured list),
+      `is_pr` (`"true"` / `"false"`), `upstream`, `fork`. -/
+  | githubLabels (repos : List RepoEntry) (labels : List String) (kind : String)
+                 (authorizedUsers : List String)
 
 instance : ToJson SourceConfig where
   toJson
@@ -92,6 +103,12 @@ instance : ToJson SourceConfig where
                     ("labels", ToJson.toJson labels),
                     ("max", Json.num max),
                     ("kind", kind)]
+    | .githubLabels repos labels kind authorizedUsers =>
+        Json.mkObj [("type", "github-labels"),
+                    ("repos", ToJson.toJson repos),
+                    ("labels", ToJson.toJson labels),
+                    ("kind", kind),
+                    ("authorized_users", ToJson.toJson authorizedUsers)]
 
 /-- Parse a `repos` list from JSON.  If `"repos"` is absent, fall back to the singular
     `"fork"` string (treated as both `upstream` and `fork`). -/
@@ -142,6 +159,12 @@ instance : FromJson SourceConfig where
         let max    ← j.getObjValAs? Nat "max"
         let kind    := j.getObjValAs? String "kind" |>.toOption |>.getD "issues"
         return .githubLabelCount repos labels max kind
+    | "github-labels" =>
+        let repos          ← parseRepos j
+        let labels          := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
+        let kind            := j.getObjValAs? String "kind" |>.toOption |>.getD "all"
+        let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
+        return .githubLabels repos labels kind authorizedUsers
     | _ => .error s!"unknown source type: {ty}"
 
 -- Action template
@@ -817,6 +840,72 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
                      ("upstream_escaped", entry.upstream.toString.replace "/" "_"),
                      ("fork_escaped",     entry.fork.toString.replace "/" "_")]
         allEvents := allEvents.push ("", vars)
+    return allEvents
+
+  | .githubLabels repos labels kind sourceAuthorizedUsers => do
+    let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
+    let mut allEvents : Array (String × List (String × String)) := #[]
+    -- Track IDs seen this tick to deduplicate across per-label queries.
+    let mut seenIds : Array String := #[]
+    for entry in repos do
+      -- Collect candidate items. One query per label (OR logic); one unlabelled query if empty.
+      let mut items : Array Json := #[]
+      if labels.isEmpty then
+        let jsonOpt ← runGhApi
+          s!"/repos/{entry.upstream}/issues?state=open&per_page=100" ghToken
+        items := match jsonOpt with
+          | none   => #[]
+          | some j => j.getArr?.toOption |>.getD #[]
+      else
+        for lbl in labels do
+          let jsonOpt ← runGhApi
+            s!"/repos/{entry.upstream}/issues?state=open&per_page=100&labels={lbl}" ghToken
+          let batch : Array Json := match jsonOpt with
+            | none   => #[]
+            | some j => j.getArr?.toOption |>.getD #[]
+          items := items ++ batch
+      for item in items do
+        let isPr := (item.getObjVal? "pull_request").isOk
+        let kindMatch := match kind with
+          | "issues" => !isPr
+          | "pulls"  => isPr
+          | _        => true
+        if !kindMatch then continue
+        let .ok numJson := item.getObjVal? "number" | continue
+        let numStr  := toString numJson
+        let eventId := s!"{entry.upstream}:{numStr}"
+        if state.processedIds.contains eventId then continue
+        if seenIds.contains eventId then continue
+        seenIds := seenIds.push eventId
+        let itemLabelNames : List String :=
+          (item.getObjValAs? (Array Json) "labels" |>.toOption |>.getD #[]).toList.filterMap
+            (fun l => l.getObjValAs? String "name" |>.toOption)
+        let matchedLabels :=
+          if labels.isEmpty then itemLabelNames
+          else labels.filter (fun l => itemLabelNames.contains l)
+        if !labels.isEmpty && matchedLabels.isEmpty then continue
+        let author := match item.getObjVal? "user" |>.toOption with
+          | none   => ""
+          | some u => u.getObjValAs? String "login" |>.toOption |>.getD ""
+        if !isAuthorized allowed author then continue
+        let title := item.getObjValAs? String "title"    |>.toOption |>.getD ""
+        let body  := item.getObjValAs? String "body"     |>.toOption |>.getD ""
+        let url   := item.getObjValAs? String "html_url" |>.toOption |>.getD ""
+        let vars := [
+          ("issue_number",   numStr),
+          ("title",          title),
+          ("body",           body),
+          ("url",            url),
+          ("author",         author),
+          ("labels",         ",".intercalate itemLabelNames),
+          ("matched_labels", ",".intercalate matchedLabels),
+          ("is_pr",          if isPr then "true" else "false"),
+          ("upstream",       entry.upstream.toString),
+          ("fork",           entry.fork.toString),
+          ("upstream_escaped", entry.upstream.toString.replace "/" "_"),
+          ("fork_escaped",     entry.fork.toString.replace "/" "_")
+        ]
+        allEvents := allEvents.push (eventId, vars)
     return allEvents
 
 end Orchestra.Listener
