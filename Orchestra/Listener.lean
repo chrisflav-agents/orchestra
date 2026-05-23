@@ -566,7 +566,11 @@ def buildRoleEntry (project : Project.Project) (role : Project.Role)
 
 /--
 Poll a source for new events not yet in `state.processedIds`.
-Returns an array of `(eventId, templateVars)` pairs.
+Returns a pair of:
+- an array of `(eventId, templateVars)` pairs, and
+- an optional replacement for `processedIds` (used by sources that need to prune stale IDs,
+  e.g. `githubLabels` removes IDs for items whose label was since stripped so the listener
+  re-fires when the label is re-applied).  `none` means "append new IDs as usual".
 `eventId` is `""` for shell sources (no deduplication by ID).
 Event IDs for GitHub sources are prefixed with the upstream slug
 (e.g. `"my-account/orchestra:12345"`) so a single state file
@@ -574,7 +578,7 @@ correctly deduplicates events across multiple repos.
 -/
 def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String)
     (globalAuthorizedUsers : List String := [])
-    : IO (Array (String × List (String × String))) := do
+    : IO (Array (String × List (String × String)) × Option (Array String)) := do
   match source with
 
   | .githubIssues repos labels trigger sourceAuthorizedUsers => do
@@ -611,7 +615,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
                          ("upstream_escaped", entry.upstream.toString.replace "/" "_"),
                          ("fork_escaped", entry.fork.toString.replace "/" "_")]
           allEvents := allEvents.push (eventId, vars)
-    return allEvents
+    return (allEvents, none)
 
   | .githubPrReviews repos labels trigger sourceAuthorizedUsers => do
     let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
@@ -670,12 +674,12 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
             ("fork_escaped",     entry.fork.toString.replace "/" "_")
           ]
           allEvents := allEvents.push (eventId, vars)
-    return allEvents
+    return (allEvents, none)
 
   | .githubComments repos labels trigger sourceAuthorizedUsers => do
     -- On the first run lastChecked is empty: initialise state and return nothing,
     -- so we don't flood the queue with all historical comments.
-    if state.lastChecked.isEmpty then return #[]
+    if state.lastChecked.isEmpty then return (#[], none)
     let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
     let mut allEvents : Array (String × List (String × String)) := #[]
     for entry in repos do
@@ -773,7 +777,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           for comment in inlineComments do
             if let some ev ← processCommentJson true comment then
               allEvents := allEvents.push ev
-    return allEvents
+    return (allEvents, none)
 
   | .shell cmd args => do
     let child ← IO.Process.spawn {
@@ -786,12 +790,12 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let out ← child.stdout.readToEnd
     let _   ← child.wait
     let trimmed := out.trimAscii.toString
-    if trimmed.isEmpty then return #[]
-    return #[("", [("output", trimmed)])]
+    if trimmed.isEmpty then return (#[], none)
+    return (#[("", [("output", trimmed)])], none)
 
   | .projectDispatcher pid caps => do
     let some _project ← Project.loadProject pid
-      | IO.eprintln s!"[dispatcher] project {pid.value} not found; skipping"; return #[]
+      | IO.eprintln s!"[dispatcher] project {pid.value} not found; skipping"; return (#[], none)
     let issues ← Project.loadIssues pid
     let roles  ← Project.loadAllRoles pid
     -- Count active per-role queue entries scoped to this project.
@@ -806,12 +810,12 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let spawns := dispatcherTick { activeByRole := active, issues, caps, roles }
     -- Emit synthetic events. eventId is empty so the listener-state dedup
     -- doesn't accumulate (each tick is fresh; the cap is the dedup mechanism).
-    return spawns.map fun s =>
+    return (spawns.map fun s =>
       let baseVars : List (String × String) := [("role_name", s.roleName)]
       let vars := match s.issueId with
         | some iid => baseVars ++ [("issue_id", iid.value)]
         | none     => baseVars
-      ("", vars)
+      ("", vars), none)
 
   | .githubLabelCount repos labels max kind => do
     let mut allEvents : Array (String × List (String × String)) := #[]
@@ -840,13 +844,14 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
                      ("upstream_escaped", entry.upstream.toString.replace "/" "_"),
                      ("fork_escaped",     entry.fork.toString.replace "/" "_")]
         allEvents := allEvents.push ("", vars)
-    return allEvents
+    return (allEvents, none)
 
   | .githubLabels repos labels kind sourceAuthorizedUsers => do
     let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
     let mut allEvents : Array (String × List (String × String)) := #[]
-    -- Track IDs seen this tick to deduplicate across per-label queries.
-    let mut seenIds : Array String := #[]
+    -- currentIds: all kind-matching labeled items visible this tick (used to prune
+    -- processedIds so that a label removal followed by re-application re-triggers).
+    let mut currentIds : Array String := #[]
     for entry in repos do
       -- Collect candidate items. One query per label (OR logic); one unlabelled query if empty.
       let mut items : Array Json := #[]
@@ -874,9 +879,10 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
         let .ok numJson := item.getObjVal? "number" | continue
         let numStr  := toString numJson
         let eventId := s!"{entry.upstream}:{numStr}"
+        -- Deduplicate within this tick and record as currently visible.
+        if currentIds.contains eventId then continue
+        currentIds := currentIds.push eventId
         if state.processedIds.contains eventId then continue
-        if seenIds.contains eventId then continue
-        seenIds := seenIds.push eventId
         let itemLabelNames : List String :=
           (item.getObjValAs? (Array Json) "labels" |>.toOption |>.getD #[]).toList.filterMap
             (fun l => l.getObjValAs? String "name" |>.toOption)
@@ -906,6 +912,9 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           ("fork_escaped",     entry.fork.toString.replace "/" "_")
         ]
         allEvents := allEvents.push (eventId, vars)
-    return allEvents
+    -- Prune processedIds to only currently-visible items so that a label removal
+    -- followed by re-application causes the listener to fire again.
+    let prunedProcessed := state.processedIds.filter (fun id => currentIds.contains id)
+    return (allEvents, some (prunedProcessed ++ allEvents.map (·.1)))
 
 end Orchestra.Listener
