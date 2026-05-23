@@ -714,7 +714,8 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
               -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
               let resolvedPath := Listener.renderTemplate wfPath vars
               try
-                let yaml ← IO.FS.readFile resolvedPath
+                let rawYaml ← IO.FS.readFile resolvedPath
+                let yaml := Listener.renderTemplate rawYaml vars
                 match Workflow.WorkflowProgram.parseYaml yaml with
                 | .error e =>
                   IO.eprintln s!"  Listener '{liveCfg.name}': workflow parse error: {e}"
