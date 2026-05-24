@@ -166,7 +166,10 @@ private def runTriage {i o : ResultType} (ioTask : IOTask i o)
     GitHub.addIssueLabels ioTask.upstream issueNumber addLabels
   for label in removeLabels do
     IO.println s!"  [triage] removing label '{label}' from {ioTask.upstream}#{issueNumber}"
-    GitHub.removeIssueLabel ioTask.upstream issueNumber label
+    try
+      GitHub.removeIssueLabel ioTask.upstream issueNumber label
+    catch e =>
+      IO.eprintln s!"  [triage] failed to remove label '{label}': {e}"
   TaskStore.saveTask { initialRecord with status := .completed }
   IO.println s!"  [triage] done"
 

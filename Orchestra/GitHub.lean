@@ -180,14 +180,12 @@ def addIssueLabels (repo : Repository) (issueNumber : Nat) (labels : List String
       "--input", "-"
     ] (input := payload.compress)
 
-/-- Remove a label from a GitHub issue or pull request. Succeeds even if the label is not present. -/
-def removeIssueLabel (repo : Repository) (issueNumber : Nat) (label : String) : IO Unit :=
-  try
-    let _ ← runCmd "gh" #[
-      "api", "--method", "DELETE",
-      s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels/{label}"
-    ]
-  catch _ => pure ()
+/-- Remove a label from a GitHub issue or pull request. -/
+def removeIssueLabel (repo : Repository) (issueNumber : Nat) (label : String) : IO Unit := do
+  let _ ← runCmd "gh" #[
+    "api", "--method", "DELETE",
+    s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels/{label}"
+  ]
 
 /-- Post a comment on an issue or pull request. -/
 def createIssueComment (pat : String) (upstream : Repository) (issueNumber : Nat) (body : String) : IO String := do
