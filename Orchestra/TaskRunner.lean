@@ -154,7 +154,7 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
 /-- Run a triage task: add and/or remove labels on a GitHub issue or pull request.
     Skips the entire agent / sandbox / MCP path.
     Used when `ioTask.backend = some "triage"`. -/
-private def runTriage {i o : ResultType} (ioTask : IOTask i o)
+private def runTriage {i o : ResultType} (pat : String) (ioTask : IOTask i o)
     (initialRecord : TaskStore.TaskRecord) : IO Unit := do
   IO.println "  [triage] label backend"
   let some issueNumber := ioTask.issueNumber
@@ -163,11 +163,11 @@ private def runTriage {i o : ResultType} (ioTask : IOTask i o)
   let removeLabels := ioTask.triageRemoveLabels
   if !addLabels.isEmpty then
     IO.println s!"  [triage] adding labels {addLabels} to {ioTask.upstream}#{issueNumber}"
-    GitHub.addIssueLabels ioTask.upstream issueNumber addLabels
+    GitHub.addIssueLabels pat ioTask.upstream issueNumber addLabels
   for label in removeLabels do
     IO.println s!"  [triage] removing label '{label}' from {ioTask.upstream}#{issueNumber}"
     try
-      GitHub.removeIssueLabel ioTask.upstream issueNumber label
+      GitHub.removeIssueLabel pat ioTask.upstream issueNumber label
     catch e =>
       IO.eprintln s!"  [triage] failed to remove label '{label}': {e}"
   TaskStore.saveTask { initialRecord with status := .completed }
@@ -360,7 +360,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- Triage: add/remove labels on an issue or PR. Shares auth setup but skips
   -- the repo clone, MCP server, and agent.
   if ioTask.backend == some "triage" then
-    runTriage ioTask initialRecord
+    runTriage appConfig.pat ioTask initialRecord
     return ((taskId, false), none, none)
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
